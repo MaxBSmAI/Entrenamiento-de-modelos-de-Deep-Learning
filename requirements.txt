@@ -1,0 +1,14 @@
+timm
+ultralytics
+datasets
+transformers
+opencv-python
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+psutil
+gpustat
+pycocotools
+seaborn
