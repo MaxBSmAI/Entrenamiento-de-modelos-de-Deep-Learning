@@ -7,7 +7,7 @@ Dataloader para el dataset:
 Características clave:
 - NO necesitas descargar COCO manualmente en tu notebook.
 - Por defecto usa "streaming=True" para NO almacenar el dataset completo en disco.
-- Permite usar el mismo batch size = 8 para comparar el rendimiento entre
+- Permite usar el mismo batch size = 8 para comparar el rendimien}to entre
   RTX 4080 y la A100 del supercomputador.
 
 El formato de salida es compatible con:
