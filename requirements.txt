@@ -1,14 +1,29 @@
+# Vision / DL ecosystem (sin torch/torchvision: van en el Dockerfile)
 timm
 ultralytics
 datasets
 transformers
+
+# Imagen / preprocesamiento
 opencv-python
+Pillow
+
+# Ciencia de datos / métricas
 numpy
 pandas
 scikit-learn
+
+# Visualización
 matplotlib
+seaborn
+
+# Utilidades
 tqdm
 psutil
 gpustat
 pycocotools
-seaborn
+
+# Opcionales recomendados
+albumentations
+rich
+tensorboard
