@@ -12,6 +12,11 @@ Script para:
 
 Salida principal en:
     result/detection/
+
+Ejecución recomendada desde la raíz del proyecto:
+
+    export PYTHONPATH=./src
+    python src/detection/detection_results.py
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from __future__ import annotations
 import json
 import csv
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -78,7 +83,7 @@ def parse_run_info(path: Path) -> Dict[str, Any]:
     test_metrics = data.get("test_metrics", {})
     benchmark = data.get("benchmark", {})
 
-    device_name = benchmark.get("device_name") or benchmark.get("device") or "unknown"
+    device_name = (benchmark.get("device_name") or benchmark.get("device") or "unknown").strip()
 
     mean_latency_ms = benchmark.get("mean_latency_ms")
     fps = benchmark.get("fps")
@@ -393,6 +398,7 @@ def generate_4080_vs_a100_plots(
 # ------------------------------------------------------------
 
 def main() -> None:
+    # src/detection/detection_results.py → project_root 2 niveles arriba
     project_root = Path(__file__).resolve().parents[2]
     result_root = project_root / "result"
     det_dir = result_root / "detection"

@@ -1,17 +1,22 @@
 """
-classification_results.py
+segmentation_results.py
 
 Script para:
-- Leer todos los *_metrics.json bajo result/classification/.
+- Leer todos los *_metrics.json bajo result/segmentation/.
 - Construir un resumen en CSV.
 - Generar gráficos comparativos de:
-    * Desempeño del modelo (accuracy, f1_macro) entre modelos en un mismo dispositivo.
+    * Desempeño del modelo (mIoU, Dice) entre modelos en un mismo dispositivo.
     * Desempeño computacional (FPS, latencia, throughput, VRAM) entre:
         - modelos en un mismo dispositivo;
         - RTX 4080 vs A100 para cada modelo.
 
 Salida principal en:
-    result/classification/
+    result/segmentation/
+
+Ejecución recomendada desde la raíz del proyecto:
+
+    export PYTHONPATH=./src
+    python src/segmentation/segmentation_results.py
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from __future__ import annotations
 import json
 import csv
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,25 +37,54 @@ from utils.utils_plot import plot_benchmark_comparison
 # Utilidades de lectura
 # ------------------------------------------------------------
 
-def find_classification_metrics(result_root: Path) -> List[Path]:
+def find_segmentation_metrics(result_root: Path) -> List[Path]:
     """
-    Busca todos los *_metrics.json bajo result/classification/.
+    Busca todos los *_metrics.json bajo result/segmentation/.
     """
-    class_root = result_root / "classification"
-    if not class_root.exists():
+    seg_root = result_root / "segmentation"
+    if not seg_root.exists():
         return []
-    return list(class_root.rglob("*_metrics.json"))
+    return list(seg_root.rglob("*_metrics.json"))
+
+
+def _get_miou(test_metrics: Dict[str, Any]) -> Any:
+    """
+    Intenta extraer una métrica de mIoU con nombres flexibles.
+    """
+    return (
+        test_metrics.get("miou")
+        or test_metrics.get("mIoU")
+        or test_metrics.get("mean_iou")
+        or test_metrics.get("iou_mean")
+        or test_metrics.get("mIoU_val")
+    )
+
+
+def _get_dice(test_metrics: Dict[str, Any]) -> Any:
+    """
+    Intenta extraer una métrica de Dice con nombres flexibles.
+    """
+    return (
+        test_metrics.get("dice")
+        or test_metrics.get("dice_coef")
+        or test_metrics.get("dice_score")
+        or test_metrics.get("mean_dice")
+    )
 
 
 def parse_run_info(path: Path) -> Dict[str, Any]:
     """
-    Parsea un archivo *_metrics.json de CLASIFICACIÓN.
+    Parsea un archivo *_metrics.json de SEGMENTACIÓN.
 
     Estructura esperada (flexible):
 
     {
         "test_loss": ...,
-        "test_metrics": {...},
+        "test_metrics": {
+            "miou": ...,
+            "dice": ...,
+            ...
+        },
         "benchmark": {
             "device_name": "RTX 4080",
             "batch_size": ...,
@@ -65,17 +99,16 @@ def parse_run_info(path: Path) -> Dict[str, Any]:
     with open(path, "r") as f:
         data = json.load(f)
 
-    # model_name: usamos la carpeta inmediatamente anterior o el stem del archivo
-    # Ejemplo: result/classification/resnet50_miniimagenet/resnet50_miniimagenet_metrics.json
+    # Nombre de modelo: carpeta inmediatamente anterior o stem
+    # Ejemplo: result/segmentation/deeplabv3_vine/deeplabv3_vine_metrics.json
     model_name = path.stem.replace("_metrics", "")
-    if path.parent.name != "classification":
-        # si hay subcarpeta, suele ser el nombre más limpio
+    if path.parent.name != "segmentation":
         model_name = path.parent.name
 
     test_metrics = data.get("test_metrics", {})
     benchmark = data.get("benchmark", {})
 
-    device_name = benchmark.get("device_name") or benchmark.get("device") or "unknown"
+    device_name = (benchmark.get("device_name") or benchmark.get("device") or "unknown").strip()
 
     mean_latency_ms = benchmark.get("mean_latency_ms")
     fps = benchmark.get("fps")
@@ -89,7 +122,7 @@ def parse_run_info(path: Path) -> Dict[str, Any]:
 
     run_info = {
         "path": str(path),
-        "task": "classification",
+        "task": "segmentation",
         "model_name": model_name,
         "device_name": device_name,
         "test_loss": data.get("test_loss"),
@@ -115,19 +148,19 @@ def parse_run_info(path: Path) -> Dict[str, Any]:
 # CSV resumen
 # ------------------------------------------------------------
 
-def write_classification_csv(runs: List[Dict[str, Any]], class_dir: Path) -> Path:
+def write_segmentation_csv(runs: List[Dict[str, Any]], seg_dir: Path) -> Path:
     """
-    Escribe un CSV con el resumen de CLASIFICACIÓN.
+    Escribe un CSV con el resumen de SEGMENTACIÓN.
     """
-    csv_path = class_dir / "summary_classification_runs.csv"
-    class_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = seg_dir / "summary_segmentation_runs.csv"
+    seg_dir.mkdir(parents=True, exist_ok=True)
 
     fieldnames = [
         "model_name",
         "device_name",
         "test_loss",
-        "accuracy",
-        "f1_macro",
+        "miou",
+        "dice",
         "mean_latency_ms",
         "fps",
         "throughput",
@@ -148,12 +181,15 @@ def write_classification_csv(runs: List[Dict[str, Any]], class_dir: Path) -> Pat
             tm = r.get("test_metrics", {})
             bm = r.get("benchmark", {})
 
+            miou = _get_miou(tm)
+            dice = _get_dice(tm)
+
             row = {
                 "model_name": r.get("model_name"),
                 "device_name": r.get("device_name"),
                 "test_loss": r.get("test_loss"),
-                "accuracy": tm.get("accuracy"),
-                "f1_macro": tm.get("f1_macro"),
+                "miou": miou,
+                "dice": dice,
                 "mean_latency_ms": bm.get("mean_latency_ms"),
                 "fps": bm.get("fps"),
                 "throughput": bm.get("throughput"),
@@ -167,7 +203,7 @@ def write_classification_csv(runs: List[Dict[str, Any]], class_dir: Path) -> Pat
             }
             writer.writerow(row)
 
-    print(f"[INFO] Resumen de clasificación escrito en: {csv_path}")
+    print(f"[INFO] Resumen de segmentación escrito en: {csv_path}")
     return csv_path
 
 
@@ -194,11 +230,11 @@ def group_by_model_and_device(
 
     Retorna:
         {
-            "resnet50_miniimagenet": {
+            "deeplabv3_vine": {
                 "RTX 4080": run_info,
                 "A100": run_info,
             },
-            "vit_b16_miniimagenet": {
+            "segformer_vine": {
                 ...
             }
         }
@@ -217,21 +253,14 @@ def group_by_model_and_device(
 
 def plot_metric_across_models(
     runs: List[Dict[str, Any]],
-    metric_key: str,
-    metric_source: str,
+    metric_name: str,
     device_name: str,
     save_path: Path,
     title: str,
 ) -> None:
     """
-    Grafica una métrica (accuracy, f1_macro, fps, etc.) entre modelos
+    Grafica una métrica de desempeño (mIoU, Dice) entre modelos
     para un mismo dispositivo.
-
-    metric_source:
-        - "test_metrics"
-        - "benchmark"
-    metric_key:
-        - p.ej. "accuracy", "f1_macro", "fps", "mean_latency_ms", ...
     """
     names: List[str] = []
     values: List[float] = []
@@ -240,8 +269,58 @@ def plot_metric_across_models(
         if str(r["device_name"]) != device_name:
             continue
 
-        src = r["test_metrics"] if metric_source == "test_metrics" else r["benchmark"]
-        v = src.get(metric_key)
+        tm = r["test_metrics"]
+
+        if metric_name == "miou":
+            v = _get_miou(tm)
+        elif metric_name == "dice":
+            v = _get_dice(tm)
+        else:
+            v = tm.get(metric_name)
+
+        if v is None:
+            continue
+
+        names.append(r["model_name"])
+        values.append(float(v))
+
+    if not names:
+        return
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(8, 4))
+    idx = np.arange(len(names))
+    plt.bar(idx, values)
+    plt.xticks(idx, names, rotation=45, ha="right")
+    plt.ylabel(metric_name)
+    plt.title(f"{title} ({device_name})")
+    plt.grid(axis="y", linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"[INFO] Gráfico guardado: {save_path}")
+
+
+def plot_benchmark_across_models(
+    runs: List[Dict[str, Any]],
+    metric_key: str,
+    device_name: str,
+    save_path: Path,
+    title: str,
+) -> None:
+    """
+    Grafica una métrica de benchmark (fps, latencia, etc.) entre modelos
+    para un mismo dispositivo.
+    """
+    names: List[str] = []
+    values: List[float] = []
+
+    for r in runs:
+        if str(r["device_name"]) != device_name:
+            continue
+
+        v = r["benchmark"].get(metric_key)
         if v is None:
             continue
 
@@ -268,12 +347,12 @@ def plot_metric_across_models(
 
 def generate_model_vs_model_plots(
     runs: List[Dict[str, Any]],
-    class_dir: Path,
+    seg_dir: Path,
 ) -> None:
     """
     Genera gráficos de:
-      - accuracy entre modelos en cada dispositivo
-      - f1_macro entre modelos en cada dispositivo
+      - mIoU entre modelos en cada dispositivo
+      - Dice entre modelos en cada dispositivo
       - FPS entre modelos en cada dispositivo
       - Latencia entre modelos en cada dispositivo
     """
@@ -283,45 +362,41 @@ def generate_model_vs_model_plots(
         # desempeño
         plot_metric_across_models(
             runs_dev,
-            metric_key="accuracy",
-            metric_source="test_metrics",
+            metric_name="miou",
             device_name=device_name,
-            save_path=class_dir / f"classification_accuracy_{device_name}.png",
-            title="Accuracy por modelo",
+            save_path=seg_dir / f"segmentation_miou_{device_name}.png",
+            title="mIoU por modelo",
         )
 
         plot_metric_across_models(
             runs_dev,
-            metric_key="f1_macro",
-            metric_source="test_metrics",
+            metric_name="dice",
             device_name=device_name,
-            save_path=class_dir / f"classification_f1_macro_{device_name}.png",
-            title="F1 macro por modelo",
+            save_path=seg_dir / f"segmentation_dice_{device_name}.png",
+            title="Dice por modelo",
         )
 
         # computacional
-        plot_metric_across_models(
+        plot_benchmark_across_models(
             runs_dev,
             metric_key="fps",
-            metric_source="benchmark",
             device_name=device_name,
-            save_path=class_dir / f"benchmark_fps_{device_name}.png",
+            save_path=seg_dir / f"segmentation_benchmark_fps_{device_name}.png",
             title="FPS por modelo",
         )
 
-        plot_metric_across_models(
+        plot_benchmark_across_models(
             runs_dev,
             metric_key="mean_latency_ms",
-            metric_source="benchmark",
             device_name=device_name,
-            save_path=class_dir / f"benchmark_latency_ms_{device_name}.png",
+            save_path=seg_dir / f"segmentation_benchmark_latency_ms_{device_name}.png",
             title="Latencia (ms) por modelo",
         )
 
 
 def generate_4080_vs_a100_plots(
     runs: List[Dict[str, Any]],
-    class_dir: Path,
+    seg_dir: Path,
     device_a: str = "RTX 4080",
     device_b: str = "A100",
 ) -> None:
@@ -355,7 +430,7 @@ def generate_4080_vs_a100_plots(
                 continue
 
             filename = f"{model_name}_{metric_key}_RTX4080_vs_A100.png"
-            save_path = class_dir / filename
+            save_path = seg_dir / filename
 
             plot_benchmark_comparison(
                 benchmarks=benchmarks_dict,
@@ -372,25 +447,26 @@ def generate_4080_vs_a100_plots(
 # ------------------------------------------------------------
 
 def main() -> None:
+    # src/segmentation/segmentation_results.py → project_root 2 niveles arriba
     project_root = Path(__file__).resolve().parents[2]
     result_root = project_root / "result"
-    class_dir = result_root / "classification"
+    seg_dir = result_root / "segmentation"
 
-    metric_files = find_classification_metrics(result_root)
+    metric_files = find_segmentation_metrics(result_root)
     if not metric_files:
-        print("[WARN] No se encontraron *_metrics.json en result/classification/")
+        print("[WARN] No se encontraron *_metrics.json en result/segmentation/")
         return
 
     runs = [parse_run_info(p) for p in metric_files]
 
     # 1) CSV resumen
-    write_classification_csv(runs, class_dir)
+    write_segmentation_csv(runs, seg_dir)
 
     # 2) Comparaciones entre modelos (mismo dispositivo)
-    generate_model_vs_model_plots(runs, class_dir)
+    generate_model_vs_model_plots(runs, seg_dir)
 
     # 3) Comparaciones RTX 4080 vs A100 para cada modelo
-    generate_4080_vs_a100_plots(runs, class_dir, device_a="RTX 4080", device_b="A100")
+    generate_4080_vs_a100_plots(runs, seg_dir, device_a="RTX 4080", device_b="A100")
 
 
 if __name__ == "__main__":
