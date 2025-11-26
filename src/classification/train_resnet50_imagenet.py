@@ -12,6 +12,12 @@ y guarda:
 
 Salida principal en:
     result/classification/resnet50_miniimagenet/
+
+Ejecución recomendada desde la raíz del proyecto:
+
+    cd /workspace
+    export PYTHONPATH=./src
+    python src/classification/train_resnet50_imagenet.py --streaming
 """
 
 from __future__ import annotations
@@ -24,7 +30,9 @@ from typing import Dict, Any, Tuple, List
 
 import sys
 
-# --- AÑADIR src al sys.path para que funcionen los imports relativos ---
+# ----------------------------------------------------------------------
+# AÑADIR src al sys.path para que funcionen los imports (data, utils, ...)
+# ----------------------------------------------------------------------
 SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -44,12 +52,12 @@ from sklearn.metrics import (
 )
 
 from data.dataloaders import get_miniimagenet_dataloaders
-from utils.utils_benchmark import throughput_from_latency
+from utils.utils_benchmark import throughput_from_latency  # por si se usa más adelante
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Utilidades generales
-# ------------------------------------------------------------
+# ============================================================
 
 def set_seed(seed: int = 42) -> None:
     import random
@@ -76,9 +84,9 @@ def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
     return model
 
 
-# ------------------------------------------------------------
-# Loop de entrenamiento y evaluación
-# ------------------------------------------------------------
+# ============================================================
+# Loop de entrenamiento y evaluación (compatible IterableDataset)
+# ============================================================
 
 def train_one_epoch(
     model: nn.Module,
@@ -91,7 +99,6 @@ def train_one_epoch(
     Entrena una época completa.
 
     IMPORTANTE: soporta IterableDataset → NO usa len(dataloader.dataset).
-    En su lugar, va contando explícitamente cuántos ejemplos se han visto.
     """
     model.train()
     running_loss = 0.0
@@ -117,13 +124,12 @@ def train_one_epoch(
         all_preds.extend(preds.detach().cpu().tolist())
         all_targets.extend(labels.detach().cpu().tolist())
 
-    # si por alguna razón no hubo datos, evitamos división por 0
     if n_samples == 0:
         epoch_loss = 0.0
         epoch_acc = 0.0
     else:
         epoch_loss = running_loss / n_samples
-        epoch_acc = accuracy_score(all_targets, all_targets if not all_preds else all_preds)
+        epoch_acc = accuracy_score(all_targets, all_preds)
 
     return epoch_loss, epoch_acc
 
@@ -181,15 +187,15 @@ def evaluate(
     return epoch_loss, metrics
 
 
-# ------------------------------------------------------------
-# Early Stopping sencillo
-# ------------------------------------------------------------
+# ============================================================
+# Early Stopping
+# ============================================================
 
 class EarlyStopping:
     """
-    Early stopping basado en la métrica de validación (p.ej. val_loss).
+    Early stopping basado en la métrica de validación (val_loss).
 
-    Para este script, usamos val_loss (minimizar).
+    Se detiene cuando val_loss deja de mejorar después de 'patience' épocas.
     """
 
     def __init__(self, patience: int = 5, min_delta: float = 0.0):
@@ -209,9 +215,9 @@ class EarlyStopping:
                 self.should_stop = True
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Benchmark de inferencia
-# ------------------------------------------------------------
+# ============================================================
 
 @torch.no_grad()
 def benchmark_classification_model(
@@ -221,7 +227,9 @@ def benchmark_classification_model(
     max_batches: int = 20,
 ) -> Dict[str, Any]:
     """
-    Mide latencia promedio por batch, FPS y VRAM de forma sencilla.
+    Mide latencia promedio por batch, FPS, throughput y VRAM.
+
+    Usa hasta 'max_batches' batches del dataloader para no tardar demasiado.
     """
     model.eval()
 
@@ -259,6 +267,7 @@ def benchmark_classification_model(
     if num_batches == 0:
         return {
             "device_name": device_name,
+            "batch_size": getattr(dataloader, "batch_size", None),
             "mean_latency_ms": None,
             "fps": None,
             "throughput": None,
@@ -268,7 +277,6 @@ def benchmark_classification_model(
             "params_m": None,
             "power_w": None,
             "efficiency_fps_w": None,
-            "batch_size": getattr(dataloader, "batch_size", None),
         }
 
     mean_latency_ms = (total_time / num_batches) * 1000.0
@@ -284,7 +292,7 @@ def benchmark_classification_model(
 
     # Parámetros del modelo
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
-    flops_g = None  # lo dejamos como None (se puede integrar ptflops más adelante)
+    flops_g = None  # se puede integrar ptflops más adelante
 
     benchmark = {
         "device_name": device_name,
@@ -302,9 +310,177 @@ def benchmark_classification_model(
     return benchmark
 
 
-# ------------------------------------------------------------
-# (el resto del archivo: parse_args, main, etc.)
-# ------------------------------------------------------------
+# ============================================================
+# Argumentos / hiperparámetros
+# ============================================================
 
-# TODO: deja tal cual la parte de parse_args(), main(), etc. que ya tienes.
-#       Solo necesitábamos modificar train_one_epoch y evaluate.
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train ResNet-50 on Mini-ImageNet")
+
+    parser.add_argument("--epochs", type=int, default=30, help="Número máximo de épocas")
+    parser.add_argument("--batch_size", type=int, default=8, help="Tamaño de batch")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--patience", type=int, default=5, help="Patience de early stopping")
+    parser.add_argument("--min_delta", type=float, default=0.0, help="Mejora mínima para resetear patience")
+    parser.add_argument("--run_name", type=str, default="resnet50_miniimagenet", help="Nombre de la corrida")
+    parser.add_argument("--no_pretrained", action="store_true", help="No usar pesos preentrenados")
+    parser.add_argument("--streaming", action="store_true", help="Usar streaming desde HuggingFace (IterableDataset)")
+
+    return parser.parse_args()
+
+
+# ============================================================
+# main
+# ============================================================
+
+def main() -> None:
+    args = parse_args()
+    set_seed(42)
+
+    device = get_device()
+    print(f"[INFO] Usando dispositivo: {device}")
+
+    # Rutas
+    project_root = Path(__file__).resolve().parents[2]  # .../workspace
+    result_root = project_root / "result" / "classification"
+    run_dir = result_root / args.run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = run_dir / f"{args.run_name}_best.pth"
+    metrics_path = run_dir / f"{args.run_name}_metrics.json"
+
+    # DataLoaders
+    print(f"[INFO] Cargando Mini-ImageNet (HuggingFace, streaming={args.streaming})...")
+    train_loader, val_loader, test_loader, num_classes = get_miniimagenet_dataloaders(
+        batch_size=args.batch_size,
+        streaming=args.streaming,
+    )
+    print(f"[INFO] Número de clases: {num_classes}")
+
+    # Modelo
+    model = build_model(num_classes=num_classes, pretrained=not args.no_pretrained)
+    model.to(device)
+
+    # Optimización
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    early_stopping = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+    }
+
+    # --------------------------------------------------------
+    # Loop de entrenamiento
+    # --------------------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        print(f"\n[Epoch {epoch}/{args.epochs}]")
+
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_metrics = evaluate(model, val_loader, criterion, device)
+
+        val_acc = val_metrics["accuracy"]
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
+        print(
+            f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+        )
+
+        scheduler.step()
+
+        # Early stopping basado en val_loss
+        if val_loss < best_val_loss - args.min_delta:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            early_stopping.counter = 0
+
+            torch.save(model.state_dict(), model_path)
+            print(f"  [INFO] Mejor val_loss hasta ahora. Modelo guardado en: {model_path}")
+        else:
+            early_stopping.step(val_loss)
+            print(f"  [INFO] EarlyStopping counter: {early_stopping.counter}/{early_stopping.patience}")
+
+        if early_stopping.should_stop:
+            print("[INFO] Early stopping activado. Fin del entrenamiento.")
+            break
+
+    print(f"\n[INFO] Entrenamiento finalizado. Mejor época: {best_epoch}, mejor val_loss: {best_val_loss:.4f}")
+
+    # --------------------------------------------------------
+    # Cargar mejor modelo y evaluar en test
+    # --------------------------------------------------------
+    if model_path.exists():
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"[INFO] Mejor modelo cargado desde: {model_path}")
+
+    test_loss, test_metrics = evaluate(model, test_loader, criterion, device)
+    print(
+        f"[TEST] Loss: {test_loss:.4f} | "
+        f"Acc: {test_metrics['accuracy']:.4f} | "
+        f"F1-macro: {test_metrics['f1_macro']:.4f}"
+    )
+
+    # --------------------------------------------------------
+    # Benchmark de inferencia
+    # --------------------------------------------------------
+    print("\n[INFO] Ejecutando benchmark de inferencia...")
+    benchmark = benchmark_classification_model(model, test_loader, device, max_batches=20)
+    if benchmark["fps"] is not None:
+        print(
+            f"[BENCHMARK] Device: {benchmark['device_name']} | "
+            f"Latencia media (ms): {benchmark['mean_latency_ms']:.3f} | "
+            f"FPS: {benchmark['fps']:.2f}"
+        )
+    else:
+        print("[BENCHMARK] sin datos")
+
+    # --------------------------------------------------------
+    # Guardar métricas en JSON
+    # --------------------------------------------------------
+    metrics_dict: Dict[str, Any] = {
+        "model_name": args.run_name,
+        "task": "classification",
+        "dataset": "mini-imagenet",
+        "num_classes": num_classes,
+        "epochs": args.epochs,
+        "best_epoch": best_epoch,
+        "train_history": history,
+        "test_loss": float(test_loss),
+        "test_metrics": {
+            "accuracy": float(test_metrics["accuracy"]),
+            "f1_macro": float(test_metrics["f1_macro"]),
+            "precision_macro": float(test_metrics["precision_macro"]),
+            "recall_macro": float(test_metrics["recall_macro"]),
+        },
+        "benchmark": benchmark,
+    }
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_dict, f, indent=4)
+
+    print(f"[INFO] Métricas guardadas en: {metrics_path}")
+
+
+if __name__ == "__main__":
+    main()

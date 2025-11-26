@@ -293,7 +293,7 @@ def benchmark_classification_model(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ViT-B/16 on Mini-ImageNet")
 
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=5e-2)
