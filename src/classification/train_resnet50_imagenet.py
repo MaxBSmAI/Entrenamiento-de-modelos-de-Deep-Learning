@@ -1,48 +1,100 @@
-import os
+"""
+train_resnet50_imagenet.py
+
+Entrena un modelo ResNet-50 en Mini-ImageNet (streaming desde HuggingFace)
+y guarda:
+
+- El mejor modelo según val_loss (early stopping).
+- Un archivo JSON con:
+    * test_loss
+    * test_metrics: accuracy, f1_macro, precision_macro, recall_macro
+    * benchmark: latencia, fps, throughput, VRAM, etc.
+
+Salida principal en:
+    result/classification/resnet50_miniimagenet/
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
 import time
 from pathlib import Path
+from typing import Dict, Any, Tuple, List
+
+import sys
+
+# --- AÑADIDO: meter src en sys.path para poder hacer from data... ---
+SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+# --------------------------------------------------------------------
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import timm
+from torch.utils.data import DataLoader
+from torchvision import models
 
-from data.dataloaders import get_miniimagenet_dataloaders
-from utils.utils_metrics import classification_metrics
-from utils.utils_plot import plot_loss, plot_accuracy
-from utils.utils_benchmark import (
-    measure_inference_latency,
-    measure_fps,
-    gpu_memory_usage,
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
 )
 
+from data.dataloaders import get_miniimagenet_dataloaders
+from utils.utils_benchmark import throughput_from_latency
 
-def get_device():
+
+# ------------------------------------------------------------
+# Utilidades generales
+# ------------------------------------------------------------
+
+def set_seed(seed: int = 42) -> None:
+    import random
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_model(num_classes: int):
+def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
     """
-    ResNet-50 preentrenada en ImageNet, ajustada a mini-ImageNet (100 clases).
+    Crea un ResNet-50 y reemplaza la capa final para num_classes.
     """
-    model = timm.create_model("resnet50", pretrained=False)
-    in_features = model.get_classifier().in_features
-    model.reset_classifier(num_classes=num_classes)
-    # Por compatibilidad con variantes tipo torchvision
-    if hasattr(model, "fc"):
-        model.fc = nn.Linear(in_features, num_classes)
+    weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+    model = models.resnet50(weights=weights)
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
     return model
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+# ------------------------------------------------------------
+# Loop de entrenamiento y evaluación
+# ------------------------------------------------------------
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+) -> Tuple[float, float]:
     model.train()
     running_loss = 0.0
-    n_samples = 0
+    all_preds: List[int] = []
+    all_targets: List[int] = []
 
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         outputs = model(images)
@@ -50,192 +102,334 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
 
-        batch_size = labels.size(0)
-        running_loss += loss.item() * batch_size
-        n_samples += batch_size
+        running_loss += loss.item() * images.size(0)
 
-    epoch_loss = running_loss / max(n_samples, 1)
-    return epoch_loss
+        preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().tolist())
+        all_targets.extend(labels.detach().cpu().tolist())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    epoch_acc = accuracy_score(all_targets, all_preds)
+
+    return epoch_loss, epoch_acc
 
 
-def evaluate(model, loader, criterion, device):
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> Tuple[float, Dict[str, float]]:
     model.eval()
     running_loss = 0.0
-    n_samples = 0
+    all_preds: List[int] = []
+    all_targets: List[int] = []
 
-    all_preds = []
-    all_labels = []
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
 
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+        running_loss += loss.item() * images.size(0)
 
-            batch_size = labels.size(0)
-            running_loss += loss.item() * batch_size
-            n_samples += batch_size
+        preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().tolist())
+        all_targets.extend(labels.detach().cpu().tolist())
 
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
+    epoch_loss = running_loss / len(dataloader.dataset)
 
-    epoch_loss = running_loss / max(n_samples, 1)
-    all_preds = torch.cat(all_preds).numpy()
-    all_labels = torch.cat(all_labels).numpy()
+    acc = accuracy_score(all_targets, all_preds)
+    f1_macro = f1_score(all_targets, all_preds, average="macro")
+    prec_macro = precision_score(all_targets, all_preds, average="macro", zero_division=0)
+    rec_macro = recall_score(all_targets, all_preds, average="macro", zero_division=0)
 
-    return epoch_loss, all_preds, all_labels
+    metrics = {
+        "accuracy": acc,
+        "f1_macro": f1_macro,
+        "precision_macro": prec_macro,
+        "recall_macro": rec_macro,
+    }
+    return epoch_loss, metrics
 
 
-def main():
-    # -------------------------------------------------
-    # Configuración general
-    # -------------------------------------------------
+# ------------------------------------------------------------
+# Early Stopping sencillo
+# ------------------------------------------------------------
+
+class EarlyStopping:
+    """
+    Early stopping basado en la métrica de validación (p.ej. val_loss).
+
+    Para este script, usamos val_loss (minimizar).
+    """
+
+    def __init__(self, patience: int = 5, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_value: float | None = None
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, value: float) -> None:
+        if self.best_value is None or (self.best_value - value) > self.min_delta:
+            self.best_value = value
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+
+
+# ------------------------------------------------------------
+# Benchmark de inferencia
+# ------------------------------------------------------------
+
+@torch.no_grad()
+def benchmark_classification_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    max_batches: int = 20,
+) -> Dict[str, Any]:
+    """
+    Mide latencia promedio por batch, FPS y VRAM de forma sencilla.
+    """
+    model.eval()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        device_name = torch.cuda.get_device_name(0)
+    else:
+        device_name = "cpu"
+
+    total_images = 0
+    total_time = 0.0
+    num_batches = 0
+
+    for i, (images, _) in enumerate(dataloader):
+        if i >= max_batches:
+            break
+
+        images = images.to(device)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start = time.time()
+
+        _ = model(images)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        end = time.time()
+
+        batch_time = end - start
+        total_time += batch_time
+        total_images += images.size(0)
+        num_batches += 1
+
+    if num_batches == 0:
+        return {
+            "device_name": device_name,
+            "mean_latency_ms": None,
+            "fps": None,
+            "throughput": None,
+            "vram_used_mb": None,
+            "vram_total_mb": None,
+            "flops_g": None,
+            "params_m": None,
+            "power_w": None,
+            "efficiency_fps_w": None,
+            "batch_size": getattr(dataloader, "batch_size", None),
+        }
+
+    mean_latency_ms = (total_time / num_batches) * 1000.0
+    fps = total_images / total_time if total_time > 0 else None
+    throughput = fps  # para clasificación, fps ~ samples/s
+
+    if device.type == "cuda":
+        vram_used_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**2)
+    else:
+        vram_used_mb = None
+        total_mem = None
+
+    # Parámetros del modelo
+    params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    flops_g = None  # lo dejamos como None (se puede integrar ptflops más adelante)
+
+    benchmark = {
+        "device_name": device_name,
+        "batch_size": dataloader.batch_size,
+        "mean_latency_ms": mean_latency_ms,
+        "fps": fps,
+        "throughput": throughput,
+        "vram_used_mb": vram_used_mb,
+        "vram_total_mb": total_mem,
+        "flops_g": flops_g,
+        "params_m": params_m,
+        "power_w": None,
+        "efficiency_fps_w": None,
+    }
+    return benchmark
+
+
+# ------------------------------------------------------------
+# main
+# ------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train ResNet-50 on Mini-ImageNet")
+
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=5, help="Patience de early stopping")
+    parser.add_argument("--run_name", type=str, default="resnet50_miniimagenet")
+    parser.add_argument("--no_pretrained", action="store_true", help="No usar pesos preentrenados")
+    parser.add_argument("--streaming", action="store_true", help="Usar streaming desde HuggingFace")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(42)
+
     device = get_device()
-    print(f"Usando dispositivo: {device}")
+    print(f"[INFO] Usando dispositivo: {device}")
 
+    # Rutas
     project_root = Path(__file__).resolve().parents[2]
+    result_root = project_root / "result" / "classification"
+    run_dir = result_root / args.run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    result_dir = project_root / "result" / "classification" / "resnet50_miniimagenet"
-    models_dir = project_root / "models" / "classification"
-    result_dir.mkdir(parents=True, exist_ok=True)
-    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = run_dir / f"{args.run_name}_best.pth"
+    metrics_path = run_dir / f"{args.run_name}_metrics.json"
 
-    # Hiperparámetros
-    batch_size = 8          # estándar para comparar RTX 4080 vs A100
-    img_size = 224
-    num_epochs = 10        # máximo; early stopping cortará antes
-    lr = 1e-4
-    weight_decay = 1e-4
+    # DataLoaders
+    print("[INFO] Cargando Mini-ImageNet (HuggingFace, streaming={})...".format(args.streaming))
+    train_loader, val_loader, test_loader, num_classes = get_miniimagenet_dataloaders(
+        batch_size=args.batch_size,
+        streaming=args.streaming,
+    )
+    print(f"[INFO] Número de clases: {num_classes}")
 
-    # Early stopping
-    patience = 5            # epochs sin mejora en val_loss
-    patience_counter = 0
+    # Modelo
+    model = build_model(num_classes=num_classes, pretrained=not args.no_pretrained)
+    model.to(device)
 
-    # -------------------------------------------------
-    # DataLoaders desde HuggingFace (map-style)
-    # -------------------------------------------------
-    # streaming=False: dataset cacheado dentro del contenedor,
-    # NO en el notebook local.
-    train_loader, val_loader, test_loader, num_classes = \
-        get_miniimagenet_dataloaders(
-            batch_size=batch_size,
-            img_size=img_size,
-            streaming=False,
-        )
-
-    print(f"Número de clases (mini-ImageNet): {num_classes}")
-
-    # -------------------------------------------------
-    # Modelo, loss, optimizador
-    # -------------------------------------------------
-    model = build_model(num_classes).to(device)
+    # Optimización
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Scheduler opcional (cosine)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    early_stopping = EarlyStopping(patience=args.patience)
 
     best_val_loss = float("inf")
-    best_model_path = models_dir / "resnet50_miniimagenet_best.pth"
+    best_epoch = -1
 
-    train_losses, val_losses, val_accuracies = [], [], []
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+    }
 
-    # -------------------------------------------------
-    # Loop de entrenamiento con EARLY STOPPING
-    # -------------------------------------------------
-    for epoch in range(1, num_epochs + 1):
-        epoch_start = time.time()
+    # --------------------------------------------------------
+    # Loop de entrenamiento
+    # --------------------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        print(f"\n[Epoch {epoch}/{args.epochs}]")
 
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_preds, val_labels = evaluate(model, val_loader, criterion, device)
-        metrics_val = classification_metrics(val_labels, val_preds)
-        val_acc = metrics_val["accuracy"]
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_metrics = evaluate(model, val_loader, criterion, device)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_accuracies.append(val_acc)
+        val_acc = val_metrics["accuracy"]
 
-        elapsed = time.time() - epoch_start
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+
         print(
-            f"[Epoch {epoch}/{num_epochs}] "
-            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val Acc: {val_acc:.4f} | Tiempo: {elapsed:.2f} s"
+            f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
         )
 
-        # -------- Early Stopping basado en val_loss --------
+        # Scheduler
+        scheduler.step()
+
+        # Early stopping basado en val_loss
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            patience_counter = 0
+            best_epoch = epoch
+            early_stopping.counter = 0
 
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  👉 Mejor modelo actualizado: {best_model_path}")
+            # Guardamos el mejor modelo
+            torch.save(model.state_dict(), model_path)
+            print(f"  [INFO] Mejor val_loss hasta ahora. Modelo guardado en: {model_path}")
         else:
-            patience_counter += 1
-            print(f"  ⚠️ No mejora en validación ({patience_counter}/{patience})")
+            early_stopping.step(val_loss)
+            print(f"  [INFO] EarlyStopping counter: {early_stopping.counter}/{early_stopping.patience}")
 
-            if patience_counter >= patience:
-                print("\n🛑 EARLY STOPPING ACTIVADO")
-                print(f"Se detiene el entrenamiento en epoch {epoch}")
-                break
+        if early_stopping.should_stop:
+            print("[INFO] Early stopping activado. Fin del entrenamiento.")
+            break
 
-    # -------------------------------------------------
-    # Graficar métricas de entrenamiento
-    # -------------------------------------------------
-    plot_loss(train_losses, result_dir / "train_loss.png")
-    plot_loss(val_losses, result_dir / "val_loss.png")
-    plot_accuracy(val_accuracies, result_dir / "val_accuracy.png")
+    print(f"\n[INFO] Entrenamiento finalizado. Mejor época: {best_epoch}, mejor val_loss: {best_val_loss:.4f}")
 
-    # -------------------------------------------------
-    # Evaluación final en TEST usando el MEJOR modelo
-    # -------------------------------------------------
-    print("\nEvaluando en TEST con el mejor modelo guardado...")
-    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    # --------------------------------------------------------
+    # Cargar mejor modelo y evaluar en test
+    # --------------------------------------------------------
+    if model_path.exists():
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"[INFO] Mejor modelo cargado desde: {model_path}")
 
-    test_loss, test_preds, test_labels = evaluate(model, test_loader, criterion, device)
-    test_metrics = classification_metrics(test_labels, test_preds)
+    test_loss, test_metrics = evaluate(model, test_loader, criterion, device)
+    print(f"[TEST] Loss: {test_loss:.4f} | Acc: {test_metrics['accuracy']:.4f} | F1-macro: {test_metrics['f1_macro']:.4f}")
 
-    print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
+    # --------------------------------------------------------
+    # Benchmark de inferencia
+    # --------------------------------------------------------
+    print("\n[INFO] Ejecutando benchmark de inferencia...")
+    benchmark = benchmark_classification_model(model, test_loader, device, max_batches=20)
+    print(f"[BENCHMARK] Device: {benchmark['device_name']} | Latencia media (ms): {benchmark['mean_latency_ms']:.3f}"
+          f" | FPS: {benchmark['fps']:.2f}" if benchmark["fps"] is not None else "[BENCHMARK] sin datos")
 
-    # -------------------------------------------------
-    # Benchmark computacional (latencia, FPS, VRAM)
-    # -------------------------------------------------
-    dummy_input = torch.randn(batch_size, 3, img_size, img_size, device=device)
-
-    mean_lat, std_lat = measure_inference_latency(model, dummy_input, runs=50)
-    fps = measure_fps(model, dummy_input, duration_seconds=5)
-    vram_used, vram_total = gpu_memory_usage()
-
-    benchmark_info = {
-        "batch_size": batch_size,
-        "img_size": img_size,
-        "device": str(device),
-        "mean_latency_ms": float(mean_lat),
-        "std_latency_ms": float(std_lat),
-        "fps": float(fps),
-        "vram_used_mb": float(vram_used),
-        "vram_total_mb": float(vram_total),
-    }
-
-    # -------------------------------------------------
-    # Guardar métricas y benchmark en JSON
-    # -------------------------------------------------
-    summary = {
+    # --------------------------------------------------------
+    # Guardar métricas en JSON
+    # --------------------------------------------------------
+    metrics_dict: Dict[str, Any] = {
+        "model_name": args.run_name,
+        "task": "classification",
+        "dataset": "mini-imagenet",
+        "num_classes": num_classes,
+        "epochs": args.epochs,
+        "best_epoch": best_epoch,
+        "train_history": history,
         "test_loss": float(test_loss),
-        "test_metrics": test_metrics,
-        "benchmark": benchmark_info,
-        "num_epochs_trained": len(train_losses),
-        "batch_size": batch_size,
-        "img_size": img_size,
-        "early_stopping_patience": patience,
+        "test_metrics": {
+            "accuracy": float(test_metrics["accuracy"]),
+            "f1_macro": float(test_metrics["f1_macro"]),
+            "precision_macro": float(test_metrics["precision_macro"]),
+            "recall_macro": float(test_metrics["recall_macro"]),
+        },
+        "benchmark": benchmark,
     }
 
-    metrics_path = result_dir / "resnet50_miniimagenet_metrics.json"
     with open(metrics_path, "w") as f:
-        json.dump(summary, f, indent=4)
+        json.dump(metrics_dict, f, indent=4)
 
-    print(f"\nMétricas y benchmark guardados en: {metrics_path}")
-    print("Entrenamiento ResNet50 en mini-ImageNet completado.")
+    print(f"[INFO] Métricas guardadas en: {metrics_path}")
 
 
 if __name__ == "__main__":
