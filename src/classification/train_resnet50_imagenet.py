@@ -317,7 +317,7 @@ def benchmark_classification_model(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ResNet-50 on Mini-ImageNet")
 
-    parser.add_argument("--epochs", type=int, default=30, help="Número máximo de épocas")
+    parser.add_argument("--epochs", type=int, default=5, help="Número máximo de épocas")
     parser.add_argument("--batch_size", type=int, default=8, help="Tamaño de batch")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
