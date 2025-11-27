@@ -1,14 +1,16 @@
 """
 train_resnet50_imagenet.py
 
-Entrena un modelo ResNet-50 en Mini-ImageNet (streaming desde HuggingFace)
-y guarda:
+Entrena un modelo ResNet-50 en Mini-ImageNet y guarda:
 
 - El mejor modelo según val_loss (early stopping).
 - Un archivo JSON con:
     * test_loss
     * test_metrics: accuracy, f1_macro, precision_macro, recall_macro
     * benchmark: latencia, fps, throughput, VRAM, etc.
+
+Soporta:
+    --streaming True/False   para usar o no streaming desde HuggingFace.
 
 Salida principal en:
     result/classification/resnet50_miniimagenet/
@@ -17,7 +19,7 @@ Ejecución recomendada desde la raíz del proyecto:
 
     cd /workspace
     export PYTHONPATH=./src
-    python src/classification/train_resnet50_imagenet.py --streaming
+    python src/classification/train_resnet50_imagenet.py --streaming True
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ from sklearn.metrics import (
 )
 
 from data.dataloaders import get_miniimagenet_dataloaders
-from utils.utils_benchmark import throughput_from_latency  # por si se usa más adelante
+from utils.utils_benchmark import throughput_from_latency  # por si lo usas luego
 
 
 # ============================================================
@@ -311,8 +313,30 @@ def benchmark_classification_model(
 
 
 # ============================================================
-# Argumentos / hiperparámetros
+# Parser: streaming con type=bool (robusto vía str2bool)
 # ============================================================
+
+def str2bool(v) -> bool:
+    """
+    Convierte cadenas tipo 'true'/'false', '1'/'0', 'yes'/'no' a bool.
+
+    Ejemplos válidos:
+        --streaming True
+        --streaming False
+        --streaming 1
+        --streaming 0
+        --streaming yes
+        --streaming no
+    """
+    if isinstance(v, bool):
+        return v
+    v = str(v).lower()
+    if v in ("yes", "y", "true", "t", "1"):
+        return True
+    if v in ("no", "n", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Valor booleano inválido: {v}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ResNet-50 on Mini-ImageNet")
@@ -325,7 +349,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_delta", type=float, default=0.0, help="Mejora mínima para resetear patience")
     parser.add_argument("--run_name", type=str, default="resnet50_miniimagenet", help="Nombre de la corrida")
     parser.add_argument("--no_pretrained", action="store_true", help="No usar pesos preentrenados")
-    parser.add_argument("--streaming", action="store_true", help="Usar streaming desde HuggingFace (IterableDataset)")
+
+    # Aquí controlas el default: True o False
+    parser.add_argument(
+        "--streaming",
+        type=str2bool,
+        default=True,  # <-- puedes cambiar a False si quieres
+        help="True=usa streaming desde HuggingFace (IterableDataset); False=usa dataset local/descargado",
+    )
 
     return parser.parse_args()
 
@@ -340,6 +371,7 @@ def main() -> None:
 
     device = get_device()
     print(f"[INFO] Usando dispositivo: {device}")
+    print(f"[INFO] Parámetro streaming: {args.streaming}")
 
     # Rutas
     project_root = Path(__file__).resolve().parents[2]  # .../workspace
@@ -351,7 +383,7 @@ def main() -> None:
     metrics_path = run_dir / f"{args.run_name}_metrics.json"
 
     # DataLoaders
-    print(f"[INFO] Cargando Mini-ImageNet (HuggingFace, streaming={args.streaming})...")
+    print(f"[INFO] Cargando Mini-ImageNet (streaming={args.streaming})...")
     train_loader, val_loader, test_loader, num_classes = get_miniimagenet_dataloaders(
         batch_size=args.batch_size,
         streaming=args.streaming,

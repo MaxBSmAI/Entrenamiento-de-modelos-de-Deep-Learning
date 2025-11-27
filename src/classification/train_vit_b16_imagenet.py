@@ -1,8 +1,7 @@
 """
 train_vit_b16_imagenet.py
 
-Entrena un modelo Vision Transformer ViT-B/16 en Mini-ImageNet (streaming desde
-HuggingFace) y guarda:
+Entrena un modelo Vision Transformer ViT-B/16 en Mini-ImageNet y guarda:
 
 - El mejor modelo según val_loss (early stopping).
 - Un archivo JSON con:
@@ -10,13 +9,17 @@ HuggingFace) y guarda:
     * test_metrics: accuracy, f1_macro, precision_macro, recall_macro
     * benchmark: latencia, fps, throughput, VRAM, etc.
 
+Soporta:
+    --streaming True/False   para usar o no streaming desde HuggingFace.
+
 Salida principal en:
     result/classification/vit_b16_miniimagenet/
 
 Ejecución recomendada desde la raíz del proyecto:
 
+    cd /workspace
     export PYTHONPATH=./src
-    python src/classification/train_vit_b16_imagenet.py --streaming
+    python src/classification/train_vit_b16_imagenet.py --streaming True
 """
 
 from __future__ import annotations
@@ -29,7 +32,9 @@ from typing import Dict, Any, Tuple, List
 
 import sys
 
-# --- Añadir src al sys.path para que funcionen los imports relativos ---
+# ----------------------------------------------------------------------
+# AÑADIR src al sys.path para que funcionen los imports (data, utils, ...)
+# ----------------------------------------------------------------------
 SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -47,15 +52,15 @@ from sklearn.metrics import (
     recall_score,
 )
 
-import timm
+import timm  # ViT-B/16
 
 from data.dataloaders import get_miniimagenet_dataloaders
-from utils.utils_benchmark import throughput_from_latency
+from utils.utils_benchmark import throughput_from_latency  # por si lo usas luego
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Utilidades generales
-# ------------------------------------------------------------
+# ============================================================
 
 def set_seed(seed: int = 42) -> None:
     import random
@@ -73,22 +78,19 @@ def get_device() -> torch.device:
 
 def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
     """
-    Crea un ViT-B/16 y ajusta la cabeza para num_classes.
-
-    Usamos timm: vit_base_patch16_224
+    Crea un ViT-B/16 usando timm y ajusta la cabeza para num_classes.
     """
-    model_name = "vit_base_patch16_224"
     model = timm.create_model(
-        model_name,
+        "vit_base_patch16_224",
         pretrained=pretrained,
         num_classes=num_classes,
     )
     return model
 
 
-# ------------------------------------------------------------
-# Loop de entrenamiento y evaluación
-# ------------------------------------------------------------
+# ============================================================
+# Loop de entrenamiento y evaluación (compatible IterableDataset)
+# ============================================================
 
 def train_one_epoch(
     model: nn.Module,
@@ -97,10 +99,16 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
 ) -> Tuple[float, float]:
+    """
+    Entrena una época completa.
+
+    IMPORTANTE: soporta IterableDataset → NO usa len(dataloader.dataset).
+    """
     model.train()
     running_loss = 0.0
     all_preds: List[int] = []
     all_targets: List[int] = []
+    n_samples = 0
 
     for images, labels in dataloader:
         images = images.to(device)
@@ -112,14 +120,20 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        n_samples += batch_size
 
         preds = outputs.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().tolist())
         all_targets.extend(labels.detach().cpu().tolist())
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = accuracy_score(all_targets, all_preds)
+    if n_samples == 0:
+        epoch_loss = 0.0
+        epoch_acc = 0.0
+    else:
+        epoch_loss = running_loss / n_samples
+        epoch_acc = accuracy_score(all_targets, all_preds)
 
     return epoch_loss, epoch_acc
 
@@ -131,10 +145,16 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
 ) -> Tuple[float, Dict[str, float]]:
+    """
+    Evalúa en validación o test.
+
+    También soporta IterableDataset (cuenta n_samples manualmente).
+    """
     model.eval()
     running_loss = 0.0
     all_preds: List[int] = []
     all_targets: List[int] = []
+    n_samples = 0
 
     for images, labels in dataloader:
         images = images.to(device)
@@ -143,18 +163,24 @@ def evaluate(
         outputs = model(images)
         loss = criterion(outputs, labels)
 
-        running_loss += loss.item() * images.size(0)
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        n_samples += batch_size
 
         preds = outputs.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().tolist())
         all_targets.extend(labels.detach().cpu().tolist())
 
-    epoch_loss = running_loss / len(dataloader.dataset)
+    if n_samples == 0:
+        epoch_loss = 0.0
+        acc = f1_macro = prec_macro = rec_macro = 0.0
+    else:
+        epoch_loss = running_loss / n_samples
 
-    acc = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro")
-    prec_macro = precision_score(all_targets, all_preds, average="macro", zero_division=0)
-    rec_macro = recall_score(all_targets, all_preds, average="macro", zero_division=0)
+        acc = accuracy_score(all_targets, all_preds)
+        f1_macro = f1_score(all_targets, all_preds, average="macro")
+        prec_macro = precision_score(all_targets, all_preds, average="macro", zero_division=0)
+        rec_macro = recall_score(all_targets, all_preds, average="macro", zero_division=0)
 
     metrics = {
         "accuracy": acc,
@@ -165,15 +191,15 @@ def evaluate(
     return epoch_loss, metrics
 
 
-# ------------------------------------------------------------
-# Early Stopping sencillo
-# ------------------------------------------------------------
+# ============================================================
+# Early Stopping
+# ============================================================
 
 class EarlyStopping:
     """
-    Early stopping basado en la métrica de validación (p.ej. val_loss).
+    Early stopping basado en la métrica de validación (val_loss).
 
-    Para este script, usamos val_loss (minimizar).
+    Se detiene cuando val_loss deja de mejorar después de 'patience' épocas.
     """
 
     def __init__(self, patience: int = 5, min_delta: float = 0.0):
@@ -193,9 +219,9 @@ class EarlyStopping:
                 self.should_stop = True
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Benchmark de inferencia
-# ------------------------------------------------------------
+# ============================================================
 
 @torch.no_grad()
 def benchmark_classification_model(
@@ -205,7 +231,9 @@ def benchmark_classification_model(
     max_batches: int = 20,
 ) -> Dict[str, Any]:
     """
-    Mide latencia promedio por batch, FPS y VRAM de forma sencilla.
+    Mide latencia promedio por batch, FPS, throughput y VRAM.
+
+    Usa hasta 'max_batches' batches del dataloader para no tardar demasiado.
     """
     model.eval()
 
@@ -243,6 +271,7 @@ def benchmark_classification_model(
     if num_batches == 0:
         return {
             "device_name": device_name,
+            "batch_size": getattr(dataloader, "batch_size", None),
             "mean_latency_ms": None,
             "fps": None,
             "throughput": None,
@@ -252,7 +281,6 @@ def benchmark_classification_model(
             "params_m": None,
             "power_w": None,
             "efficiency_fps_w": None,
-            "batch_size": getattr(dataloader, "batch_size", None),
         }
 
     mean_latency_ms = (total_time / num_batches) * 1000.0
@@ -286,24 +314,58 @@ def benchmark_classification_model(
     return benchmark
 
 
-# ------------------------------------------------------------
-# main
-# ------------------------------------------------------------
+# ============================================================
+# Parser: streaming con type=bool (robusto vía str2bool)
+# ============================================================
+
+def str2bool(v) -> bool:
+    """
+    Convierte cadenas tipo 'true'/'false', '1'/'0', 'yes'/'no' a bool.
+
+    Ejemplos válidos:
+        --streaming True
+        --streaming False
+        --streaming 1
+        --streaming 0
+        --streaming yes
+        --streaming no
+    """
+    if isinstance(v, bool):
+        return v
+    v = str(v).lower()
+    if v in ("yes", "y", "true", "t", "1"):
+        return True
+    if v in ("no", "n", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Valor booleano inválido: {v}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ViT-B/16 on Mini-ImageNet")
 
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=5e-2)
+    parser.add_argument("--epochs", type=int, default=30, help="Número máximo de épocas")
+    parser.add_argument("--batch_size", type=int, default=8, help="Tamaño de batch")
+    parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--patience", type=int, default=5, help="Patience de early stopping")
-    parser.add_argument("--run_name", type=str, default="vit_b16_miniimagenet")
+    parser.add_argument("--min_delta", type=float, default=0.0, help="Mejora mínima para resetear patience")
+    parser.add_argument("--run_name", type=str, default="vit_b16_miniimagenet", help="Nombre de la corrida")
     parser.add_argument("--no_pretrained", action="store_true", help="No usar pesos preentrenados")
-    parser.add_argument("--streaming", action="store_true", help="Usar streaming desde HuggingFace")
+
+    # Aquí controlas el default: True o False
+    parser.add_argument(
+        "--streaming",
+        type=str2bool,
+        default=True,  # puedes cambiar a False si quieres
+        help="True=usa streaming desde HuggingFace (IterableDataset); False=usa dataset local/descargado",
+    )
 
     return parser.parse_args()
 
+
+# ============================================================
+# main
+# ============================================================
 
 def main() -> None:
     args = parse_args()
@@ -311,9 +373,10 @@ def main() -> None:
 
     device = get_device()
     print(f"[INFO] Usando dispositivo: {device}")
+    print(f"[INFO] Parámetro streaming: {args.streaming}")
 
     # Rutas
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[2]  # .../workspace
     result_root = project_root / "result" / "classification"
     run_dir = result_root / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +385,7 @@ def main() -> None:
     metrics_path = run_dir / f"{args.run_name}_metrics.json"
 
     # DataLoaders
-    print("[INFO] Cargando Mini-ImageNet (HuggingFace, streaming={})...".format(args.streaming))
+    print(f"[INFO] Cargando Mini-ImageNet (streaming={args.streaming})...")
     train_loader, val_loader, test_loader, num_classes = get_miniimagenet_dataloaders(
         batch_size=args.batch_size,
         streaming=args.streaming,
@@ -333,14 +396,17 @@ def main() -> None:
     model = build_model(num_classes=num_classes, pretrained=not args.no_pretrained)
     model.to(device)
 
-    # Optimización (config típica para ViT)
+    # Optimización
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    # Scheduler Cosine
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    early_stopping = EarlyStopping(patience=args.patience)
+    early_stopping = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
 
     best_val_loss = float("inf")
     best_epoch = -1
@@ -375,16 +441,14 @@ def main() -> None:
             f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
         )
 
-        # Scheduler
         scheduler.step()
 
         # Early stopping basado en val_loss
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss - args.min_delta:
             best_val_loss = val_loss
             best_epoch = epoch
             early_stopping.counter = 0
 
-            # Guardamos el mejor modelo
             torch.save(model.state_dict(), model_path)
             print(f"  [INFO] Mejor val_loss hasta ahora. Modelo guardado en: {model_path}")
         else:
@@ -405,7 +469,11 @@ def main() -> None:
         print(f"[INFO] Mejor modelo cargado desde: {model_path}")
 
     test_loss, test_metrics = evaluate(model, test_loader, criterion, device)
-    print(f"[TEST] Loss: {test_loss:.4f} | Acc: {test_metrics['accuracy']:.4f} | F1-macro: {test_metrics['f1_macro']:.4f}")
+    print(
+        f"[TEST] Loss: {test_loss:.4f} | "
+        f"Acc: {test_metrics['accuracy']:.4f} | "
+        f"F1-macro: {test_metrics['f1_macro']:.4f}"
+    )
 
     # --------------------------------------------------------
     # Benchmark de inferencia
