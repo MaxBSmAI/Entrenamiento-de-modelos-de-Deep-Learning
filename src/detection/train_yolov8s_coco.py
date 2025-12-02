@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--data", type=str, default="coco.yaml",
                         help="YAML de datos (ej: coco.yaml)")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--img_size", type=int, default=640)
     parser.add_argument("--lr", type=float, default=1e-3)

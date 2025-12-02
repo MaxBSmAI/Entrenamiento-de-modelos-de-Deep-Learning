@@ -10,7 +10,7 @@ Características:
 - Permite entrenar en RTX 4080 y A100 con el mismo batch para comparaciones HPC.
 
 Parámetros principales:
-- batch_size = 8 (universal y estandarizado)
+- batch_size = 16 (universal y estandarizado)
 - streaming = True (default)
 """
 
@@ -100,7 +100,7 @@ def build_default_transform(img_size: int = 224):
 # ============================================================
 
 def get_miniimagenet_dataloaders(
-    batch_size: int = 8,     # <--- BATCH ESTÁNDAR UNIVERSAL
+    batch_size: int = 16,     # <--- BATCH ESTÁNDAR UNIVERSAL
     img_size: int = 224,
     num_workers: int = 4,
     streaming: bool = True,  # <--- NO DESCARGA NADA EN EL NOTEBOOK
@@ -165,7 +165,7 @@ def get_miniimagenet_dataloaders(
 
 if __name__ == "__main__":
     train_loader, val_loader, test_loader, num_classes = \
-        get_miniimagenet_dataloaders(batch_size=8, streaming=True)
+        get_miniimagenet_dataloaders(batch_size=16, streaming=True)
 
     print("Número de clases:", num_classes)
     batch = next(iter(train_loader))

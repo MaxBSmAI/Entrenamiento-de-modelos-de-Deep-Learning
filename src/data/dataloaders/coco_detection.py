@@ -7,7 +7,7 @@ Dataloader para el dataset:
 Características clave:
 - NO necesitas descargar COCO manualmente en tu notebook.
 - Por defecto usa "streaming=True" para NO almacenar el dataset completo en disco.
-- Permite usar el mismo batch size = 8 para comparar el rendimien}to entre
+- Permite usar el mismo batch size = 16 para comparar el rendimien}to entre
   RTX 4080 y la A100 del supercomputador.
 
 El formato de salida es compatible con:
@@ -123,7 +123,7 @@ def collate_fn_coco(batch):
 # ============================================================
 
 def get_coco_detection_dataloaders(
-    batch_size: int = 8,      # <--- BATCH UNIVERSAL
+    batch_size: int = 16,      # <--- BATCH UNIVERSAL
     img_size: int = 640,
     num_workers: int = 4,
     streaming: bool = True,   # <--- NO DOWNLOAD en notebook

@@ -484,7 +484,7 @@ def str2bool(v) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DETR-ResNet50 on COCO Detection")
 
-    parser.add_argument("--epochs", type=int, default=25, help="Número máximo de épocas")
+    parser.add_argument("--epochs", type=int, default=30, help="Número máximo de épocas")
     parser.add_argument("--batch_size", type=int, default=8, help="Tamaño de batch")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
