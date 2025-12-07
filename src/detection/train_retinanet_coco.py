@@ -373,7 +373,7 @@ def benchmark_detection_model(model, loader: DataLoader, device: torch.device,
 def parse_args():
     parser = argparse.ArgumentParser("Train RetinaNet on COCO")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=5)
