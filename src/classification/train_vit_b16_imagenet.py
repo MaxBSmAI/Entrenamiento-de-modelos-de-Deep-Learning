@@ -8,12 +8,23 @@ Entrena un modelo Vision Transformer ViT-B/16 en Mini-ImageNet y guarda:
     * test_loss
     * test_metrics: accuracy, f1_macro, precision_macro, recall_macro
     * benchmark: latencia, fps, throughput, VRAM, etc.
+- TODAS las salidas asociadas al entrenamiento:
+    * Curva train vs val loss
+    * Curva de accuracy en validación
+    * Métricas por clase (JSON)
+    * Matriz de confusión (cruda y normalizada) + PNG
+    * Gráfico de F1 por clase
+    * Gráfico de benchmark computacional
 
-Soporta:
-    --streaming True/False   para usar o no streaming desde HuggingFace.
+Estructura de salida principal:
 
-Salida principal en:
-    result/classification/vit_b16_miniimagenet/
+    result/classification/vit_b16_miniimagenet/<DEVICE_TAG>/
+
+Ejemplos de DEVICE_TAG:
+    - RTX_4080
+    - A100
+    - RTX_4060
+    - CPU
 
 Ejecución recomendada desde la raíz del proyecto:
 
@@ -52,10 +63,22 @@ from sklearn.metrics import (
     recall_score,
 )
 
+import numpy as np
 import timm  # ViT-B/16
 
 from data.dataloaders import get_miniimagenet_dataloaders
 from utils.utils_benchmark import throughput_from_latency  # por si lo usas luego
+from utils.utils_metrics import (
+    per_class_metrics,
+    confusion_matrix_metrics,
+)
+from utils.utils_plot import (
+    plot_train_val_loss,
+    plot_accuracy,
+    plot_confusion_matrix,
+    plot_per_class_metrics,
+    plot_benchmark_metrics,
+)
 
 
 # ============================================================
@@ -64,7 +87,6 @@ from utils.utils_benchmark import throughput_from_latency  # por si lo usas lueg
 
 def set_seed(seed: int = 42) -> None:
     import random
-    import numpy as np
 
     random.seed(seed)
     np.random.seed(seed)
@@ -72,8 +94,38 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def get_device_and_tags() -> Tuple[torch.device, str, str]:
+    """
+    Retorna:
+        - device       : torch.device (cuda o cpu)
+        - device_name  : nombre "amigable" para JSON (p.ej. 'RTX 4080', 'A100', 'CPU')
+        - device_tag   : versión para carpeta (p.ej. 'RTX_4080', 'A100', 'CPU')
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        raw_name = torch.cuda.get_device_name(0)
+
+        raw_lower = raw_name.lower()
+
+        if "4080" in raw_lower:
+            device_name = "RTX 4080"
+            device_tag = "RTX_4080"
+        elif "4060" in raw_lower:
+            device_name = "RTX 4060"
+            device_tag = "RTX_4060"
+        elif "a100" in raw_lower:
+            device_name = "A100"
+            device_tag = "A100"
+        else:
+            # fallback genérico
+            device_name = raw_name.strip()
+            device_tag = raw_name.replace(" ", "_").replace("-", "_")
+    else:
+        device = torch.device("cpu")
+        device_name = "CPU"
+        device_tag = "CPU"
+
+    return device, device_name, device_tag
 
 
 def build_model(num_classes: int, pretrained: bool = True) -> nn.Module:
@@ -191,6 +243,33 @@ def evaluate(
     return epoch_loss, metrics
 
 
+@torch.no_grad()
+def get_predictions(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> Tuple[List[int], List[int]]:
+    """
+    Obtiene TODAS las predicciones y etiquetas verdaderas en un dataloader,
+    para poder calcular matriz de confusión y métricas por clase.
+    """
+    model.eval()
+    all_preds: List[int] = []
+    all_targets: List[int] = []
+
+    for images, labels in dataloader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+
+        all_preds.extend(preds.cpu().tolist())
+        all_targets.extend(labels.cpu().tolist())
+
+    return all_targets, all_preds
+
+
 # ============================================================
 # Early Stopping
 # ============================================================
@@ -228,6 +307,7 @@ def benchmark_classification_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    device_name: str,
     max_batches: int = 20,
 ) -> Dict[str, Any]:
     """
@@ -239,9 +319,6 @@ def benchmark_classification_model(
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-        device_name = torch.cuda.get_device_name(0)
-    else:
-        device_name = "cpu"
 
     total_images = 0
     total_time = 0.0
@@ -343,7 +420,7 @@ def str2bool(v) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ViT-B/16 on Mini-ImageNet")
 
-    parser.add_argument("--epochs", type=int, default=30, help="Número máximo de épocas")
+    parser.add_argument("--epochs", type=int, default=35, help="Número máximo de épocas")
     parser.add_argument("--batch_size", type=int, default=8, help="Tamaño de batch")
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
@@ -352,11 +429,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", type=str, default="vit_b16_miniimagenet", help="Nombre de la corrida")
     parser.add_argument("--no_pretrained", action="store_true", help="No usar pesos preentrenados")
 
-    # Aquí controlas el default: True o False
     parser.add_argument(
         "--streaming",
         type=str2bool,
-        default=True,  # puedes cambiar a False si quieres
+        default=True,
         help="True=usa streaming desde HuggingFace (IterableDataset); False=usa dataset local/descargado",
     )
 
@@ -371,18 +447,21 @@ def main() -> None:
     args = parse_args()
     set_seed(42)
 
-    device = get_device()
-    print(f"[INFO] Usando dispositivo: {device}")
+    device, device_name, device_tag = get_device_and_tags()
+    print(f"[INFO] Usando dispositivo: {device} ({device_name})")
+    print(f"[INFO] Tag de dispositivo para carpeta: {device_tag}")
     print(f"[INFO] Parámetro streaming: {args.streaming}")
 
     # Rutas
     project_root = Path(__file__).resolve().parents[2]  # .../workspace
     result_root = project_root / "result" / "classification"
-    run_dir = result_root / args.run_name
+
+    model_name = args.run_name
+    run_dir = result_root / model_name / device_tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = run_dir / f"{args.run_name}_best.pth"
-    metrics_path = run_dir / f"{args.run_name}_metrics.json"
+    model_path = run_dir / f"{model_name}_best.pth"
+    metrics_path = run_dir / f"{model_name}_metrics.json"
 
     # DataLoaders
     print(f"[INFO] Cargando Mini-ImageNet (streaming={args.streaming})...")
@@ -476,10 +555,74 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
+    # Guardar curvas de entrenamiento (imágenes)
+    # --------------------------------------------------------
+    print("[INFO] Generando gráficos de entrenamiento...")
+    plot_train_val_loss(
+        history["train_loss"],
+        history["val_loss"],
+        run_dir / "train_val_loss.png",
+        title="Train vs Val Loss (ViT-B/16)",
+    )
+    plot_accuracy(
+        history["val_acc"],
+        run_dir / "val_accuracy.png",
+        title="Validation Accuracy (ViT-B/16)",
+    )
+
+    # --------------------------------------------------------
+    # Métricas por clase + matriz de confusión en test
+    # --------------------------------------------------------
+    print("[INFO] Calculando métricas por clase y matrices de confusión...")
+    y_true, y_pred = get_predictions(model, test_loader, device)
+    y_true_np = np.array(y_true)
+    y_pred_np = np.array(y_pred)
+
+    per_class = per_class_metrics(y_true_np, y_pred_np)
+    cm_raw = confusion_matrix_metrics(y_true_np, y_pred_np, normalize=None)
+    cm_norm = confusion_matrix_metrics(y_true_np, y_pred_np, normalize="true")
+
+    # Guardar JSON adicionales
+    with open(run_dir / "per_class_metrics.json", "w") as f:
+        json.dump(per_class, f, indent=4)
+
+    with open(run_dir / "confusion_matrix_raw.json", "w") as f:
+        json.dump(cm_raw, f, indent=4)
+
+    with open(run_dir / "confusion_matrix_normalized.json", "w") as f:
+        json.dump(cm_norm, f, indent=4)
+
+    # Graficar matrices y F1 por clase
+    plot_confusion_matrix(
+        cm_raw,
+        run_dir / "confusion_matrix_raw.png",
+        title="Matriz de confusión (cuentas) — ViT-B/16",
+    )
+
+    plot_confusion_matrix(
+        cm_norm,
+        run_dir / "confusion_matrix_normalized.png",
+        title="Matriz de confusión (normalizada por fila) — ViT-B/16",
+    )
+
+    plot_per_class_metrics(
+        per_class,
+        run_dir / "per_class_f1.png",
+        metric="f1",
+        title="F1 por clase (test) — ViT-B/16",
+    )
+
+    # --------------------------------------------------------
     # Benchmark de inferencia
     # --------------------------------------------------------
     print("\n[INFO] Ejecutando benchmark de inferencia...")
-    benchmark = benchmark_classification_model(model, test_loader, device, max_batches=20)
+    benchmark = benchmark_classification_model(
+        model,
+        test_loader,
+        device=device,
+        device_name=device_name,
+        max_batches=20,
+    )
     if benchmark["fps"] is not None:
         print(
             f"[BENCHMARK] Device: {benchmark['device_name']} | "
@@ -489,16 +632,25 @@ def main() -> None:
     else:
         print("[BENCHMARK] sin datos")
 
+    # Gráfico resumen de benchmark
+    plot_benchmark_metrics(
+        benchmark,
+        run_dir / "benchmark_summary.png",
+        title=f"Benchmark computacional — {model_name} ({device_name})",
+    )
+
     # --------------------------------------------------------
-    # Guardar métricas en JSON
+    # Guardar métricas en JSON principal
     # --------------------------------------------------------
     metrics_dict: Dict[str, Any] = {
-        "model_name": args.run_name,
+        "model_name": model_name,
         "task": "classification",
         "dataset": "mini-imagenet",
         "num_classes": num_classes,
         "epochs": args.epochs,
         "best_epoch": best_epoch,
+        "device_name": device_name,
+        "device_tag": device_tag,
         "train_history": history,
         "test_loss": float(test_loss),
         "test_metrics": {
@@ -508,12 +660,26 @@ def main() -> None:
             "recall_macro": float(test_metrics["recall_macro"]),
         },
         "benchmark": benchmark,
+        # Referencias a archivos adicionales (opcional, útil para trazabilidad)
+        "artifacts": {
+            "best_model_path": str(model_path),
+            "train_val_loss_png": str(run_dir / "train_val_loss.png"),
+            "val_accuracy_png": str(run_dir / "val_accuracy.png"),
+            "confusion_matrix_raw_png": str(run_dir / "confusion_matrix_raw.png"),
+            "confusion_matrix_normalized_png": str(run_dir / "confusion_matrix_normalized.png"),
+            "per_class_f1_png": str(run_dir / "per_class_f1.png"),
+            "benchmark_summary_png": str(run_dir / "benchmark_summary.png"),
+            "per_class_metrics_json": str(run_dir / "per_class_metrics.json"),
+            "confusion_matrix_raw_json": str(run_dir / "confusion_matrix_raw.json"),
+            "confusion_matrix_normalized_json": str(run_dir / "confusion_matrix_normalized.json"),
+        },
     }
 
     with open(metrics_path, "w") as f:
         json.dump(metrics_dict, f, indent=4)
 
     print(f"[INFO] Métricas guardadas en: {metrics_path}")
+    print(f"[INFO] Todos los artefactos (pesos, imágenes, JSON) guardados en: {run_dir}")
 
 
 if __name__ == "__main__":

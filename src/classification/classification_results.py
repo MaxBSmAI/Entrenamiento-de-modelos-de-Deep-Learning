@@ -1,20 +1,32 @@
 """
 classification_results.py
 
-Script para:
-- Leer todos los *_metrics.json bajo result/classification/.
-- Construir un resumen en CSV.
-- Generar gráficos comparativos de:
-    * Desempeño del modelo (accuracy, f1_macro) entre modelos en un mismo dispositivo.
-    * Desempeño computacional (FPS, latencia, throughput, VRAM) entre:
-        - modelos en un mismo dispositivo;
-        - RTX 4080 vs A100 para cada modelo.
+Resumen y análisis de TODOS los modelos de clasificación entrenados.
 
-Salida principal en:
+- Busca recursivamente todos los *_metrics.json bajo:
     result/classification/
 
-Ejecución recomendada desde la raíz del proyecto:
+- Espera el formato de JSON generado por:
+    train_resnet50_imagenet.py
+    train_vit_b16_imagenet.py
 
+- Genera:
+    1) CSV global de resultados de clasificación:
+        result/classification/summary_classification_runs.csv
+
+    2) Gráficos por dispositivo:
+        - Accuracy por modelo
+        - F1-macro por modelo
+
+    3) Gráficos de comparación entre dispositivos (por modelo):
+        - FPS
+        - Latencia media (ms)
+        - Throughput
+        - VRAM usada (MB)
+
+Ejecución recomendada (desde la raíz del proyecto):
+
+    cd /workspace
     export PYTHONPATH=./src
     python src/classification/classification_results.py
 """
@@ -26,123 +38,121 @@ import csv
 from pathlib import Path
 from typing import Dict, Any, List
 
+import sys
+
+# ----------------------------------------------------------------------
+# AÑADIR src al sys.path para que funcionen los imports (utils, etc.)
+# ----------------------------------------------------------------------
+SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+# ----------------------------------------------------------------------
+
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.utils_benchmark import throughput_from_latency
 from utils.utils_plot import plot_benchmark_comparison
 
 
-# ------------------------------------------------------------
-# Utilidades de lectura
-# ------------------------------------------------------------
+# ============================================================
+# Búsqueda de archivos *_metrics.json
+# ============================================================
 
-def find_classification_metrics(result_root: Path) -> List[Path]:
+def find_all_classification_metrics(result_root: Path) -> List[Path]:
     """
-    Busca todos los *_metrics.json bajo result/classification/.
+    Busca recursivamente todos los *_metrics.json dentro de result/classification/.
     """
-    class_root = result_root / "classification"
-    if not class_root.exists():
-        return []
-    return list(class_root.rglob("*_metrics.json"))
+    return list(result_root.rglob("*_metrics.json"))
 
 
-def parse_run_info(path: Path) -> Dict[str, Any]:
+# ============================================================
+# Parseo flexible de cada run de clasificación
+# ============================================================
+
+def parse_classification_run(path: Path) -> Dict[str, Any]:
     """
-    Parsea un archivo *_metrics.json de CLASIFICACIÓN.
+    Carga un JSON de métricas de clasificación y devuelve un diccionario estándar.
 
-    Estructura esperada (flexible):
-
-    {
-        "test_loss": ...,
-        "test_metrics": {...},
-        "benchmark": {
-            "device_name": "RTX 4080",
-            "batch_size": ...,
-            "mean_latency_ms": ...,
-            "fps": ...,
-            "vram_used_mb": ...,
-            ...
-        },
-        ...
-    }
+    Espera el formato generado por train_resnet50_imagenet.py y train_vit_b16_imagenet.py.
     """
     with open(path, "r") as f:
         data = json.load(f)
 
-    # model_name: usamos la carpeta inmediatamente anterior o el stem del archivo
-    # Ejemplo:
-    # result/classification/resnet50_miniimagenet/resnet50_miniimagenet_metrics.json
-    model_name = path.stem.replace("_metrics", "")
-    if path.parent.name != "classification":
-        # si hay subcarpeta, suele ser el nombre más limpio
-        model_name = path.parent.name
+    model_name = data.get("model_name", path.parent.name)
+    device_name = data.get("device_name", "unknown")
+    device_tag = data.get("device_tag", "unknown")
+    dataset = data.get("dataset", "unknown")
+    num_classes = data.get("num_classes", None)
+    epochs = data.get("epochs", None)
+    best_epoch = data.get("best_epoch", None)
 
-    test_metrics = data.get("test_metrics", {})
-    benchmark = data.get("benchmark", {})
+    test_loss = data.get("test_loss", None)
+    test_metrics = data.get("test_metrics", {}) or {}
+    benchmark = data.get("benchmark", {}) or {}
 
-    device_name = (benchmark.get("device_name") or benchmark.get("device") or "unknown").strip()
+    accuracy = test_metrics.get("accuracy")
+    f1_macro = test_metrics.get("f1_macro")
+    precision_macro = test_metrics.get("precision_macro")
+    recall_macro = test_metrics.get("recall_macro")
 
-    mean_latency_ms = benchmark.get("mean_latency_ms")
     fps = benchmark.get("fps")
-    vram_used_mb = benchmark.get("vram_used_mb")
-    vram_total_mb = benchmark.get("vram_total_mb")
+    latency = benchmark.get("mean_latency_ms")
     throughput = benchmark.get("throughput")
+    vram_used = benchmark.get("vram_used_mb")
 
-    if throughput is None and mean_latency_ms is not None:
-        batch_size = data.get("batch_size", benchmark.get("batch_size", 1))
-        throughput = throughput_from_latency(batch_size, mean_latency_ms)
-
-    run_info = {
-        "path": str(path),
-        "task": "classification",
+    return {
         "model_name": model_name,
         "device_name": device_name,
-        "test_loss": data.get("test_loss"),
-        "test_metrics": test_metrics,
-        "benchmark": {
-            "batch_size": data.get("batch_size", benchmark.get("batch_size")),
-            "img_size": data.get("img_size", benchmark.get("img_size")),
-            "mean_latency_ms": mean_latency_ms,
-            "fps": fps,
-            "throughput": throughput,
-            "vram_used_mb": vram_used_mb,
-            "vram_total_mb": vram_total_mb,
-            "flops_g": benchmark.get("flops_g"),
-            "params_m": benchmark.get("params_m"),
-            "power_w": benchmark.get("power_w"),
-            "efficiency_fps_w": benchmark.get("efficiency_fps_w"),
+        "device_tag": device_tag,
+        "dataset": dataset,
+        "num_classes": num_classes,
+        "epochs": epochs,
+        "best_epoch": best_epoch,
+        "test_loss": test_loss,
+        "metrics": {
+            "accuracy": accuracy,
+            "f1_macro": f1_macro,
+            "precision_macro": precision_macro,
+            "recall_macro": recall_macro,
         },
+        "benchmark": {
+            "fps": fps,
+            "latency": latency,
+            "throughput": throughput,
+            "vram_used_mb": vram_used,
+        },
+        "path": str(path),
     }
-    return run_info
 
 
-# ------------------------------------------------------------
-# CSV resumen
-# ------------------------------------------------------------
+# ============================================================
+# Escritura de CSV global
+# ============================================================
 
-def write_classification_csv(runs: List[Dict[str, Any]], class_dir: Path) -> Path:
+def write_classification_csv(runs: List[Dict[str, Any]], out_dir: Path) -> Path:
     """
-    Escribe un CSV con el resumen de CLASIFICACIÓN.
+    Escribe un CSV resumen con todas las corridas de clasificación.
     """
-    csv_path = class_dir / "summary_classification_runs.csv"
-    class_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "summary_classification_runs.csv"
 
     fieldnames = [
         "model_name",
         "device_name",
+        "device_tag",
+        "dataset",
+        "num_classes",
+        "epochs",
+        "best_epoch",
         "test_loss",
         "accuracy",
         "f1_macro",
-        "mean_latency_ms",
+        "precision_macro",
+        "recall_macro",
         "fps",
+        "latency",
         "throughput",
         "vram_used_mb",
-        "vram_total_mb",
-        "flops_g",
-        "params_m",
-        "power_w",
-        "efficiency_fps_w",
         "path",
     ]
 
@@ -151,253 +161,223 @@ def write_classification_csv(runs: List[Dict[str, Any]], class_dir: Path) -> Pat
         writer.writeheader()
 
         for r in runs:
-            tm = r.get("test_metrics", {})
-            bm = r.get("benchmark", {})
-
             row = {
-                "model_name": r.get("model_name"),
-                "device_name": r.get("device_name"),
-                "test_loss": r.get("test_loss"),
-                "accuracy": tm.get("accuracy"),
-                "f1_macro": tm.get("f1_macro"),
-                "mean_latency_ms": bm.get("mean_latency_ms"),
-                "fps": bm.get("fps"),
-                "throughput": bm.get("throughput"),
-                "vram_used_mb": bm.get("vram_used_mb"),
-                "vram_total_mb": bm.get("vram_total_mb"),
-                "flops_g": bm.get("flops_g"),
-                "params_m": bm.get("params_m"),
-                "power_w": bm.get("power_w"),
-                "efficiency_fps_w": bm.get("efficiency_fps_w"),
-                "path": r.get("path"),
+                "model_name": r["model_name"],
+                "device_name": r["device_name"],
+                "device_tag": r["device_tag"],
+                "dataset": r["dataset"],
+                "num_classes": r["num_classes"],
+                "epochs": r["epochs"],
+                "best_epoch": r["best_epoch"],
+                "test_loss": r["test_loss"],
+                "accuracy": r["metrics"]["accuracy"],
+                "f1_macro": r["metrics"]["f1_macro"],
+                "precision_macro": r["metrics"]["precision_macro"],
+                "recall_macro": r["metrics"]["recall_macro"],
+                "fps": r["benchmark"]["fps"],
+                "latency": r["benchmark"]["latency"],
+                "throughput": r["benchmark"]["throughput"],
+                "vram_used_mb": r["benchmark"]["vram_used_mb"],
+                "path": r["path"],
             }
             writer.writerow(row)
 
-    print(f"[INFO] Resumen de clasificación escrito en: {csv_path}")
+    print(f"[INFO] CSV de clasificación escrito en: {csv_path}")
     return csv_path
 
 
-# ------------------------------------------------------------
-# Agrupar por dispositivo y por modelo
-# ------------------------------------------------------------
+# ============================================================
+# Gráficos por dispositivo (accuracy y F1 por modelo)
+# ============================================================
 
-def group_by_device(runs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def generate_per_device_metric_plots(
+    runs: List[Dict[str, Any]],
+    out_dir: Path,
+) -> None:
     """
-    Agrupa ejecuciones por device_name.
+    Para cada dispositivo, genera gráficos de:
+
+        - Accuracy por modelo
+        - F1-macro por modelo
+
+    Usando todos los modelos de clasificación entrenados en ese dispositivo.
     """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Agrupar por dispositivo
     by_device: Dict[str, List[Dict[str, Any]]] = {}
     for r in runs:
-        dev = str(r["device_name"])
+        dev = r["device_name"]
         by_device.setdefault(dev, []).append(r)
-    return by_device
+
+    for device_name, dev_runs in by_device.items():
+        # Ordenar por model_name para gráficos más legibles
+        dev_runs = sorted(dev_runs, key=lambda x: x["model_name"])
+
+        model_names = [r["model_name"] for r in dev_runs]
+        accuracies = [r["metrics"]["accuracy"] for r in dev_runs]
+        f1_macros = [r["metrics"]["f1_macro"] for r in dev_runs]
+
+        # Filtrar None para evitar errores
+        acc_pairs = [(m, a) for m, a in zip(model_names, accuracies) if a is not None]
+        f1_pairs = [(m, f) for m, f in zip(model_names, f1_macros) if f is not None]
+
+        # Accuracy por modelo
+        if acc_pairs:
+            names_acc, vals_acc = zip(*acc_pairs)
+
+            plt.figure(figsize=(8, 4))
+            idx = np.arange(len(names_acc))
+            plt.bar(idx, vals_acc)
+            plt.xticks(idx, names_acc, rotation=45, ha="right")
+            plt.ylabel("Accuracy")
+            plt.title(f"Accuracy por modelo — {device_name}")
+            plt.grid(axis="y", linestyle="--", alpha=0.5)
+
+            acc_path = out_dir / f"accuracy_by_model_{device_name.replace(' ', '_')}.png"
+            plt.tight_layout()
+            plt.savefig(acc_path, bbox_inches="tight")
+            plt.close()
+
+            print(f"[INFO] Gráfico accuracy por modelo guardado: {acc_path}")
+
+        # F1-macro por modelo
+        if f1_pairs:
+            names_f1, vals_f1 = zip(*f1_pairs)
+
+            plt.figure(figsize=(8, 4))
+            idx = np.arange(len(names_f1))
+            plt.bar(idx, vals_f1)
+            plt.xticks(idx, names_f1, rotation=45, ha="right")
+            plt.ylabel("F1-macro")
+            plt.title(f"F1-macro por modelo — {device_name}")
+            plt.grid(axis="y", linestyle="--", alpha=0.5)
+
+            f1_path = out_dir / f"f1macro_by_model_{device_name.replace(' ', '_')}.png"
+            plt.tight_layout()
+            plt.savefig(f1_path, bbox_inches="tight")
+            plt.close()
+
+            print(f"[INFO] Gráfico F1-macro por modelo guardado: {f1_path}")
 
 
-def group_by_model_and_device(
-    runs: List[Dict[str, Any]]
-) -> Dict[str, Dict[str, Dict[str, Any]]]:
+# ============================================================
+# Comparación entre dispositivos (por modelo)
+# ============================================================
+
+def generate_device_comparisons(
+    runs: List[Dict[str, Any]],
+    out_dir: Path,
+) -> None:
     """
-    Agrupa por modelo y, dentro de cada modelo, por dispositivo.
+    Para cada modelo, si existe al menos 2 dispositivos distintos (ej. RTX 4080, A100),
+    genera comparaciones de:
 
-    Retorna:
-        {
-            "resnet50_miniimagenet": {
-                "RTX 4080": run_info,
-                "A100": run_info,
-            },
-            "vit_b16_miniimagenet": {
-                ...
-            }
-        }
+        - FPS
+        - Latencia (ms)
+        - Throughput
+        - VRAM usada (MB)
+
+    usando plot_benchmark_comparison de utils_plot.
     """
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Agrupar por modelo
+    by_model: Dict[str, List[Dict[str, Any]]] = {}
     for r in runs:
-        m = r["model_name"]
-        d = str(r["device_name"])
-        out.setdefault(m, {})[d] = r
-    return out
-
-
-# ------------------------------------------------------------
-# Gráficos auxiliares
-# ------------------------------------------------------------
-
-def plot_metric_across_models(
-    runs: List[Dict[str, Any]],
-    metric_key: str,
-    metric_source: str,
-    device_name: str,
-    save_path: Path,
-    title: str,
-) -> None:
-    """
-    Grafica una métrica (accuracy, f1_macro, fps, etc.) entre modelos
-    para un mismo dispositivo.
-
-    metric_source:
-        - "test_metrics"
-        - "benchmark"
-    metric_key:
-        - p.ej. "accuracy", "f1_macro", "fps", "mean_latency_ms", ...
-    """
-    names: List[str] = []
-    values: List[float] = []
-
-    for r in runs:
-        if str(r["device_name"]) != device_name:
-            continue
-
-        src = r["test_metrics"] if metric_source == "test_metrics" else r["benchmark"]
-        v = src.get(metric_key)
-        if v is None:
-            continue
-
-        names.append(r["model_name"])
-        values.append(float(v))
-
-    if not names:
-        return
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    plt.figure(figsize=(8, 4))
-    idx = np.arange(len(names))
-    plt.bar(idx, values)
-    plt.xticks(idx, names, rotation=45, ha="right")
-    plt.ylabel(metric_key)
-    plt.title(f"{title} ({device_name})")
-    plt.grid(axis="y", linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"[INFO] Gráfico guardado: {save_path}")
-
-
-def generate_model_vs_model_plots(
-    runs: List[Dict[str, Any]],
-    class_dir: Path,
-) -> None:
-    """
-    Genera gráficos de:
-      - accuracy entre modelos en cada dispositivo
-      - f1_macro entre modelos en cada dispositivo
-      - FPS entre modelos en cada dispositivo
-      - Latencia entre modelos en cada dispositivo
-    """
-    by_device = group_by_device(runs)
-
-    for device_name, runs_dev in by_device.items():
-        # desempeño
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="accuracy",
-            metric_source="test_metrics",
-            device_name=device_name,
-            save_path=class_dir / f"classification_accuracy_{device_name}.png",
-            title="Accuracy por modelo",
-        )
-
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="f1_macro",
-            metric_source="test_metrics",
-            device_name=device_name,
-            save_path=class_dir / f"classification_f1_macro_{device_name}.png",
-            title="F1 macro por modelo",
-        )
-
-        # computacional
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="fps",
-            metric_source="benchmark",
-            device_name=device_name,
-            save_path=class_dir / f"benchmark_fps_{device_name}.png",
-            title="FPS por modelo",
-        )
-
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="mean_latency_ms",
-            metric_source="benchmark",
-            device_name=device_name,
-            save_path=class_dir / f"benchmark_latency_ms_{device_name}.png",
-            title="Latencia (ms) por modelo",
-        )
-
-
-def generate_4080_vs_a100_plots(
-    runs: List[Dict[str, Any]],
-    class_dir: Path,
-    device_a: str = "RTX 4080",
-    device_b: str = "A100",
-) -> None:
-    """
-    Para cada modelo, genera comparación RTX 4080 vs A100
-    para FPS, latencia, throughput y VRAM.
-    """
-    models = group_by_model_and_device(runs)
+        mname = r["model_name"]
+        by_model.setdefault(mname, []).append(r)
 
     metrics_to_compare = [
         ("fps", "FPS"),
-        ("mean_latency_ms", "Latencia (ms)"),
+        ("latency", "Latencia (ms)"),
         ("throughput", "Throughput (samples/s)"),
         ("vram_used_mb", "VRAM usada (MB)"),
     ]
 
-    for model_name, by_dev in models.items():
-        if device_a not in by_dev or device_b not in by_dev:
+    for model_name, model_runs in by_model.items():
+        # Necesitamos al menos dos dispositivos distintos para comparar
+        devices_present = sorted(set(r["device_name"] for r in model_runs))
+        if len(devices_present) < 2:
             continue
 
-        bm_a = by_dev[device_a]["benchmark"]
-        bm_b = by_dev[device_b]["benchmark"]
+        # Construimos un diccionario {device_name: benchmark_dict}
+        benchmarks_by_device: Dict[str, Dict[str, Any]] = {}
+        for r in model_runs:
+            dev = r["device_name"]
+            benchmarks_by_device[dev] = r["benchmark"]
 
-        benchmarks_dict = {
-            device_a: bm_a,
-            device_b: bm_b,
-        }
-
-        for metric_key, label in metrics_to_compare:
-            if bm_a.get(metric_key) is None or bm_b.get(metric_key) is None:
+        for key, label in metrics_to_compare:
+            # Comprobar que al menos dos dispositivos tienen la métrica
+            non_null_count = sum(
+                1 for bm in benchmarks_by_device.values()
+                if key in bm and bm[key] is not None
+            )
+            if non_null_count < 2:
                 continue
 
-            filename = f"{model_name}_{metric_key}_RTX4080_vs_A100.png"
-            save_path = class_dir / filename
+            save_path = out_dir / f"{model_name}_{key}_by_device.png"
 
             plot_benchmark_comparison(
-                benchmarks=benchmarks_dict,
-                metric_key=metric_key,
+                benchmarks=benchmarks_by_device,
+                metric_key=key,
                 save_path=save_path,
-                title=f"{label}: {model_name} (RTX 4080 vs A100)",
+                title=f"{model_name} — {label} por dispositivo",
             )
 
-            print(f"[INFO] Gráfico guardado: {save_path}")
+            print(f"[INFO] Comparación entre dispositivos guardada: {save_path}")
 
 
-# ------------------------------------------------------------
-# main
-# ------------------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
-    # src/classification/classification_results.py → project_root 2 niveles arriba
     project_root = Path(__file__).resolve().parents[2]
-    result_root = project_root / "result"
-    class_dir = result_root / "classification"
+    class_result_root = project_root / "result" / "classification"
+    global_dir = class_result_root / "global"
 
-    metric_files = find_classification_metrics(result_root)
+    metric_files = find_all_classification_metrics(class_result_root)
     if not metric_files:
         print("[WARN] No se encontraron *_metrics.json en result/classification/")
         return
 
-    runs = [parse_run_info(p) for p in metric_files]
+    print(f"[INFO] Encontrados {len(metric_files)} archivos de métricas de clasificación.")
 
-    # 1) CSV resumen
-    write_classification_csv(runs, class_dir)
+    runs: List[Dict[str, Any]] = []
+    for p in metric_files:
+        try:
+            r = parse_classification_run(p)
+            # Filtrar por task == classification si existe (por seguridad)
+            task = None
+            try:
+                with open(p, "r") as f:
+                    d = json.load(f)
+                    task = d.get("task", None)
+            except Exception:
+                pass
 
-    # 2) Comparaciones entre modelos (mismo dispositivo)
-    generate_model_vs_model_plots(runs, class_dir)
+            if task is not None and task != "classification":
+                continue
 
-    # 3) Comparaciones RTX 4080 vs A100 para cada modelo
-    generate_4080_vs_a100_plots(runs, class_dir, device_a="RTX 4080", device_b="A100")
+            runs.append(r)
+        except Exception as e:
+            print(f"[WARN] Error al parsear {p}: {e}")
+
+    if not runs:
+        print("[WARN] No hay corridas de clasificación válidas.")
+        return
+
+    # 1) CSV global
+    write_classification_csv(runs, global_dir)
+
+    # 2) Gráficos por dispositivo (accuracy y F1-macro por modelo)
+    generate_per_device_metric_plots(runs, global_dir)
+
+    # 3) Comparación entre dispositivos (FPS, latencia, throughput, VRAM)
+    generate_device_comparisons(runs, global_dir)
+
+    print("\n[INFO] Resultados de clasificación generados correctamente.")
 
 
 if __name__ == "__main__":

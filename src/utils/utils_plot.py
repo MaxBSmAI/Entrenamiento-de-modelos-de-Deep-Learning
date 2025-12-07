@@ -32,22 +32,31 @@ def plot_loss(
     ylabel: str = "Loss",
 ) -> None:
     """
-    Grafica una curva de pérdida simple.
+    Grafica una curva de pérdida en función de la época.
 
-    Pensado para usarse como:
-        plot_loss(train_losses, result_dir / "train_loss.png")
-        plot_loss(val_losses, result_dir / "val_loss.png")
+    Parámetros
+    ----------
+    losses : list[float]
+        Lista con los valores de pérdida por época.
+    save_path : Path
+        Ruta donde se guardará la figura (formato PNG recomendado).
     """
-    epochs = range(1, len(losses) + 1)
+    if len(losses) == 0:
+        print("[WARN] plot_loss: lista de pérdidas vacía. No se genera gráfico.")
+        return
 
-    plt.figure()
+    epochs = np.arange(1, len(losses) + 1)
+
+    plt.figure(figsize=(6, 4))
     plt.plot(epochs, losses, marker="o")
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.grid(True)
+    plt.grid(True, linestyle="--", alpha=0.5)
+
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
@@ -60,18 +69,24 @@ def plot_accuracy(
     ylabel: str = "Accuracy",
 ) -> None:
     """
-    Grafica una curva de accuracy (por ejemplo, en validación).
+    Grafica la accuracy en validación por época.
     """
-    epochs = range(1, len(accuracies) + 1)
+    if len(accuracies) == 0:
+        print("[WARN] plot_accuracy: lista de accuracies vacía. No se genera gráfico.")
+        return
 
-    plt.figure()
+    epochs = np.arange(1, len(accuracies) + 1)
+
+    plt.figure(figsize=(6, 4))
     plt.plot(epochs, accuracies, marker="o")
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    plt.grid(True)
+    plt.grid(True, linestyle="--", alpha=0.5)
+
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
@@ -81,28 +96,36 @@ def plot_train_val_loss(
     val_losses: List[float],
     save_path: Path,
     title: str = "Train vs Val Loss",
+    xlabel: str = "Epoch",
+    ylabel: str = "Loss",
 ) -> None:
     """
-    Versión combinada para mostrar train y val en una misma figura (opcional).
+    Grafica las curvas de pérdida de entrenamiento y validación.
     """
-    epochs = range(1, len(train_losses) + 1)
+    if len(train_losses) == 0 or len(val_losses) == 0:
+        print("[WARN] plot_train_val_loss: listas vacías. No se genera gráfico.")
+        return
 
-    plt.figure()
-    plt.plot(epochs, train_losses, marker="o", label="Train")
-    plt.plot(epochs, val_losses, marker="s", label="Validation")
+    epochs = np.arange(1, len(train_losses) + 1)
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs, train_losses, marker="o", label="Train Loss")
+    plt.plot(epochs, val_losses, marker="o", label="Val Loss")
     plt.title(title)
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
-    plt.grid(True)
+
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
 # ======================================================
-#  Métricas por clase y matriz de confusión
+#  Métricas por clase
 # ======================================================
 
 def plot_per_class_metrics(
@@ -150,42 +173,55 @@ def plot_confusion_matrix(
     cmap: str = "Blues",
 ) -> None:
     """
-    Grafica una matriz de confusión.
+    Grafica una matriz de confusión a partir de un diccionario.
 
     Parámetros
     ----------
     cm_dict : dict
-        Salida de utils_metrics.confusion_matrix_metrics:
-        {
-            "confusion_matrix": [[...], [...], ...],
-            "labels": [0,1,2,...]
-        }
+        Debe tener, como mínimo:
+            {
+                "confusion_matrix": [[int, ...], [...], ...],
+                "labels": [0, 1, 2, ...]
+            }
+        y opcionalmente "normalize" (bool o str) para indicar el tipo de normalización.
     save_path : Path
-        Ruta de guardado de la figura.
+        Ruta donde se guarda la figura.
+    title : str
+        Título de la figura.
+    cmap : str
+        Colormap de matplotlib (por ejemplo: "Blues", "viridis", "magma").
     """
-    cm = np.array(cm_dict["confusion_matrix"])
-    labels = cm_dict["labels"]
+    cm = np.array(cm_dict.get("confusion_matrix", []))
+    labels = cm_dict.get("labels", None)
 
-    plt.figure(figsize=(6, 5))
-    plt.imshow(cm, interpolation="nearest", cmap=cmap)
+    if cm.size == 0:
+        print("[WARN] plot_confusion_matrix: cm vacío. No se genera gráfico.")
+        return
+
+    plt.figure(figsize=(6, 6))
+    im = plt.imshow(cm, interpolation="nearest", cmap=cmap)
     plt.title(title)
-    plt.colorbar()
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+
+    if labels is None:
+        labels = np.arange(cm.shape[0])
+
     tick_marks = np.arange(len(labels))
-    plt.xticks(tick_marks, labels, rotation=90)
+    plt.xticks(tick_marks, labels, rotation=45, ha="right")
     plt.yticks(tick_marks, labels)
 
-    # anotaciones
-    thresh = cm.max() / 2.0 if cm.size > 0 else 0.5
+    # Escribir los valores en las celdas
+    fmt = ".2f" if cm.dtype.kind == "f" else "d"
+    thresh = cm.max() / 2.0
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             plt.text(
                 j,
                 i,
-                f"{cm[i, j]:.2f}" if cm.dtype == float else int(cm[i, j]),
-                horizontalalignment="center",
-                verticalalignment="center",
+                format(cm[i, j], fmt),
+                ha="center",
+                va="center",
                 color="white" if cm[i, j] > thresh else "black",
-                fontsize=8,
             )
 
     plt.ylabel("True label")
@@ -233,17 +269,18 @@ def plot_benchmark_metrics(
             keys.append(label)
             values.append(float(v))
 
-    _add_if_present("mean_latency_ms", "Latencia (ms)")
+    _add_if_present("mean_latency_ms", "Latencia media (ms)")
     _add_if_present("fps", "FPS")
     _add_if_present("throughput", "Throughput (samples/s)")
     _add_if_present("vram_used_mb", "VRAM usada (MB)")
-    _add_if_present("flops_g", "FLOPs (GFLOPs)")
-    _add_if_present("params_m", "Parámetros (M)")
+    _add_if_present("vram_total_mb", "VRAM total (MB)")
+    _add_if_present("flops_g", "GFLOPs")
+    _add_if_present("params_m", "Nº Parámetros (M)")
     _add_if_present("power_w", "Potencia (W)")
-    _add_if_present("efficiency_fps_w", "FPS/W")
+    _add_if_present("efficiency_fps_w", "Eficiencia (FPS/W)")
 
     if not keys:
-        # nada que graficar
+        print("[WARN] plot_benchmark_metrics: no hay métricas numéricas en benchmark.")
         return
 
     plt.figure(figsize=(8, 4))
@@ -267,16 +304,25 @@ def plot_benchmark_comparison(
     title: Optional[str] = None,
 ) -> None:
     """
-    Compara un metric_key entre varios modelos/dispositivos.
+    Compara una métrica de benchmark entre varios dispositivos/modelos.
 
     Parámetros
     ----------
     benchmarks : dict
-        {nombre_modelo: benchmark_dict}
+        Diccionario del tipo:
+            {
+                "A100": {...},
+                "RTX 4080": {...},
+                ...
+            }
+        donde cada valor interno es el diccionario de benchmark
+        (como en utils_benchmark o plot_benchmark_metrics).
     metric_key : str
-        Clave dentro de cada benchmark_dict (por ej. 'fps', 'mean_latency_ms').
+        Clave de la métrica a comparar (p.ej. "fps", "mean_latency_ms").
     save_path : Path
-        Ruta donde se guarda el gráfico.
+        Ruta donde se guarda la figura.
+    title : str, opcional
+        Título del gráfico.
     """
     names = []
     values = []
@@ -287,6 +333,7 @@ def plot_benchmark_comparison(
             values.append(float(bm[metric_key]))
 
     if not names:
+        print(f"[WARN] plot_benchmark_comparison: no hay valores para {metric_key}.")
         return
 
     plt.figure(figsize=(8, 4))

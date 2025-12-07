@@ -10,6 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git openssh-client \
     build-essential \
     wget curl ca-certificates \
+    \
+    # NECESARIO PARA YOLOv8 / OPENCV
+    libgl1 \
+    libglib2.0-0 \
+    \
     && rm -rf /var/lib/apt/lists/*
 
 # 2) Alias "python" y "pip"
@@ -37,4 +42,3 @@ RUN useradd -ms /bin/bash vscode
 USER vscode
 
 WORKDIR /workspace
-# --- IGNORE ---

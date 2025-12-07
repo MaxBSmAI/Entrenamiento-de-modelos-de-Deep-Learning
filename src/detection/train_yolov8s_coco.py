@@ -1,10 +1,36 @@
 """
 train_yolov8s_coco.py
 
-Entrena YOLOv8s en COCO Detection. Compatible con tu estructura result/detection/.
+Entrena un modelo YOLOv8s en COCO Detection usando Ultralytics.
 
-- Por defecto entrena SIN PREENTRENADO (yolov8s.yaml).
-- Si se usa --pretrained → carga pesos COCO (yolov8s.pt).
+Salida principal en:
+    result/detection/yolov8s_coco/<DEVICE_TAG>/
+
+Guarda:
+- Pesos del mejor modelo (best.pt) en el directorio interno de Ultralytics
+  y referencia en el JSON principal.
+- JSON con:
+    * test_metrics: map_50, map_50_95
+    * benchmark: latencia, fps, throughput, VRAM, params_m, etc.
+- Figura PNG con resumen de benchmark computacional.
+
+Incluye EARLY STOPPING vía el parámetro:
+    --patience N  → se pasa directo a model.train(patience=N)
+
+NOTA:
+Ultralytics ya genera:
+    - Curvas de loss
+    - PR curves
+    - Confusion matrix
+en su propio subdirectorio (runs). Aquí nos centramos en unificar
+las métricas numéricas y el benchmark en un JSON homogéneo con el resto
+del proyecto.
+
+Ejecución recomendada desde la raíz del proyecto:
+
+    cd /workspace
+    export PYTHONPATH=./src
+    python src/detection/train_yolov8s_coco.py --data coco.yaml
 """
 
 from __future__ import annotations
@@ -13,11 +39,21 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 import sys
 
+# ----------------------------------------------------------------------
+# AÑADIR src al sys.path para que funcionen los imports
+# ----------------------------------------------------------------------
+SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+# ----------------------------------------------------------------------
+
 import torch
-from ultralytics import YOLO  # pip install ultralytics
+from ultralytics import YOLO
+
+from utils.utils_plot import plot_benchmark_metrics
 
 
 # ============================================================
@@ -34,11 +70,43 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def get_device_and_tags() -> Tuple[torch.device, str, str]:
+    """
+    Retorna:
+        - device       : torch.device (cuda o cpu)
+        - device_name  : nombre "amigable" para JSON (p.ej. 'RTX 4080', 'A100', 'CPU')
+        - device_tag   : versión para carpeta (p.ej. 'RTX_4080', 'A100', 'CPU')
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        raw_name = torch.cuda.get_device_name(0)
+        raw_lower = raw_name.lower()
+
+        if "4080" in raw_lower:
+            device_name = "RTX 4080"
+            device_tag = "RTX_4080"
+        elif "4060" in raw_lower:
+            device_name = "RTX 4060"
+            device_tag = "RTX_4060"
+        elif "a100" in raw_lower:
+            device_name = "A100"
+            device_tag = "A100"
+        else:
+            device_name = raw_name.strip()
+            device_tag = raw_name.replace(" ", "_").replace("-", "_")
+    else:
+        device = torch.device("cpu")
+        device_name = "CPU"
+        device_tag = "CPU"
+
+    return device, device_name, device_tag
 
 
 def str2bool(v) -> bool:
+    """
+    Conversor robusto para argumentos booleanos.
+    Permite: true/false, 1/0, yes/no...
+    """
     if isinstance(v, bool):
         return v
     v = str(v).lower()
@@ -50,43 +118,47 @@ def str2bool(v) -> bool:
 
 
 # ============================================================
-# Benchmark inferencia sintética
+# Benchmark de inferencia para YOLO
 # ============================================================
 
 @torch.no_grad()
-def benchmark_yolov8_model(
+def benchmark_yolo_model(
     model: YOLO,
     device: torch.device,
-    img_size: int = 640,
-    batch_size: int = 8,
-    max_batches: int = 20,
+    device_name: str,
+    imgsz: int = 640,
+    batch_size: int = 16,
+    warmup: int = 10,
+    runs: int = 50,
 ) -> Dict[str, Any]:
-
-    backend = model.model.to(device).eval()
+    """
+    Mide latencia promedio, FPS y VRAM para YOLOv8 en un input sintético.
+    """
+    model.to(device)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
-        device_name = torch.cuda.get_device_name(0)
-    else:
-        device_name = "cpu"
 
-    total_time, total_images = 0.0, 0
+    dummy = torch.randn(batch_size, 3, imgsz, imgsz, device=device)
 
-    for _ in range(max_batches):
-        x = torch.randn(batch_size, 3, img_size, img_size, device=device)
+    # Warmup
+    for _ in range(warmup):
+        _ = model(dummy, verbose=False)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
-        if device.type == "cuda": torch.cuda.synchronize()
+    total_time = 0.0
+    for _ in range(runs):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.time()
-
-        _ = backend(x)
-
-        if device.type == "cuda": torch.cuda.synchronize()
+        _ = model(dummy, verbose=False)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t1 = time.time()
-
         total_time += (t1 - t0)
-        total_images += batch_size
 
-    if total_time == 0:
+    if runs == 0 or total_time == 0.0:
         return {
             "device_name": device_name,
             "batch_size": batch_size,
@@ -101,18 +173,23 @@ def benchmark_yolov8_model(
             "efficiency_fps_w": None,
         }
 
-    mean_latency_ms = (total_time / max_batches) * 1000
-    fps = total_images / total_time
-    throughput = fps
+    mean_latency_ms = (total_time / runs) * 1000.0
+    fps = (batch_size * runs) / total_time
+    throughput = fps  # samples/s
 
     if device.type == "cuda":
-        vram_used = torch.cuda.max_memory_allocated() / (1024 ** 2)
-        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+        vram_used_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        vram_total_mb = torch.cuda.get_device_properties(0).total_memory / (1024**2)
     else:
-        vram_used = None
-        total_vram = None
+        vram_used_mb = None
+        vram_total_mb = None
 
-    params_m = sum(p.numel() for p in backend.parameters()) / 1e6
+    # Parámetros del modelo
+    params_m = None
+    try:
+        params_m = sum(p.numel() for p in model.model.parameters()) / 1e6
+    except Exception:
+        params_m = None
 
     return {
         "device_name": device_name,
@@ -120,8 +197,8 @@ def benchmark_yolov8_model(
         "mean_latency_ms": mean_latency_ms,
         "fps": fps,
         "throughput": throughput,
-        "vram_used_mb": vram_used,
-        "vram_total_mb": total_vram,
+        "vram_used_mb": vram_used_mb,
+        "vram_total_mb": vram_total_mb,
         "flops_g": None,
         "params_m": params_m,
         "power_w": None,
@@ -130,33 +207,31 @@ def benchmark_yolov8_model(
 
 
 # ============================================================
-# Argumentos
+# Parser
 # ============================================================
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train YOLOv8s on COCO")
+    parser = argparse.ArgumentParser("Train YOLOv8s on COCO")
 
-    parser.add_argument("--data", type=str, default="coco.yaml",
-                        help="YAML de datos (ej: coco.yaml)")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--img_size", type=int, default=640)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--run_name", type=str, default="yolov8s_coco")
+    parser.add_argument("--epochs", type=int, default=100, help="Número máximo de épocas")
+    parser.add_argument("--batch_size", type=int, default=16, help="Tamaño de batch")
+    parser.add_argument("--imgsz", type=int, default=640, help="Tamaño de imagen")
+    parser.add_argument("--data", type=str, default="coco.yaml", help="YAML de datos de Ultralytics")
+    parser.add_argument("--run_name", type=str, default="yolov8s_coco", help="Nombre lógico del modelo/corrida")
+    parser.add_argument("--no_pretrained", action="store_true", help="Si se usa, entrena desde cero (yolov8s.yaml)")
 
-    # 🔥 AQUÍ ESTÁ TU MODIFICACIÓN
     parser.add_argument(
-        "--pretrained",
-        action="store_true",
+        "--rect",
+        type=str2bool,
         default=False,
-        help="Si se especifica, usa pesos preentrenados (yolov8s.pt). Por defecto entrena desde cero."
+        help="Usar rect training (True/False)",
     )
 
     parser.add_argument(
-        "--streaming",
-        type=str2bool,
-        default=True,
-        help="Decorativo: YOLOv8 no usa este parámetro."
+        "--patience",
+        type=int,
+        default=5,
+        help="Épocas sin mejora antes de activar early stopping en YOLOv8.",
     )
 
     return parser.parse_args()
@@ -170,98 +245,156 @@ def main() -> None:
     args = parse_args()
     set_seed(42)
 
-    device = get_device()
-    print(f"[INFO] Device: {device}")
-    print(f"[INFO] pretrained={args.pretrained}")
-    print(f"[INFO] streaming={args.streaming} (no afecta a YOLOv8)")
+    device, device_name, device_tag = get_device_and_tags()
+    print(f"[INFO] Dispositivo: {device} ({device_name}), tag: {device_tag}")
+    print(f"[INFO] Data YAML: {args.data}")
+    print(f"[INFO] rect={args.rect}, patience={args.patience}")
 
-    # Estructura result/detection/<run_name>/
-    project_root = Path(__file__).resolve().parents[2]
-    result_dir = project_root / "result" / "detection" / args.run_name
-    result_dir.mkdir(parents=True, exist_ok=True)
+    # Carpetas principales
+    project_root = Path(__file__).resolve().parents[2]  # .../workspace
+    result_root = project_root / "result" / "detection"
 
-    metrics_path = result_dir / f"{args.run_name}_metrics.json"
+    model_name = args.run_name
+    run_root = result_root / model_name / device_tag
+    run_root.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------
-    # Cargar modelo
-    # --------------------------------------------------------
-    if args.pretrained:
-        print("[INFO] Cargando YOLOv8s preentrenado (yolov8s.pt)...")
-        model = YOLO("yolov8s.pt")
-    else:
-        print("[INFO] Entrenando YOLOv8s desde cero (yolov8s.yaml)...")
+    # Ultralytics usará este directorio como "project" y "train" como "name"
+    # De esta forma sus artefactos quedarán en:
+    #   result/detection/yolov8s_coco/<DEVICE_TAG>/train/
+    yolo_project = run_root
+    yolo_name = "train"
+
+    metrics_path = run_root / f"{model_name}_metrics.json"
+    benchmark_fig_path = run_root / "benchmark_summary.png"
+
+    # Cargar modelo YOLOv8s
+    if args.no_pretrained:
+        print("[INFO] Cargando modelo YOLOv8s desde config (sin pesos preentrenados)...")
         model = YOLO("yolov8s.yaml")
+    else:
+        print("[INFO] Cargando modelo YOLOv8s preentrenado (COCO)...")
+        model = YOLO("yolov8s.pt")
 
-    # --------------------------------------------------------
-    # Entrenamiento
-    # --------------------------------------------------------
-    device_str = "0" if device.type == "cuda" else "cpu"
+    # Seleccionar dispositivo para Ultralytics (índice 0 si hay GPU)
+    yolo_device_arg = 0 if device.type == "cuda" else "cpu"
 
-    print("\n[INFO] Iniciando entrenamiento...")
-    model.train(
+    # Entrenamiento con early stopping (patience)
+    print("\n[INFO] Iniciando entrenamiento YOLOv8s...")
+    train_results = model.train(
         data=args.data,
         epochs=args.epochs,
-        imgsz=args.img_size,
+        imgsz=args.imgsz,
         batch=args.batch_size,
-        lr0=args.lr,
-        device=device_str,
-        project=str(result_dir),
-        name="run",
+        device=yolo_device_arg,
+        project=str(yolo_project),
+        name=yolo_name,
         exist_ok=True,
+        rect=args.rect,
+        verbose=True,
+        patience=args.patience,  # <-- EARLY STOPPING
+    )
+
+    print("[INFO] Entrenamiento finalizado.")
+
+    # Localizar pesos "best.pt"
+    best_weights = yolo_project / yolo_name / "weights" / "best.pt"
+    if not best_weights.exists():
+        # Fallback: intentar buscar best*.pt en el subárbol
+        candidates = list(yolo_project.rglob("best*.pt"))
+        if candidates:
+            best_weights = candidates[0]
+
+    if best_weights.exists():
+        print(f"[INFO] Pesos del mejor modelo: {best_weights}")
+    else:
+        print("[WARN] No se encontró best.pt, se usará el modelo en memoria para evaluación.")
+
+    # Evaluación (val) para obtener mAP
+    print("\n[INFO] Evaluando mAP en split=val...")
+    eval_model = YOLO(str(best_weights)) if best_weights.exists() else model
+
+    # Ultralytics Metrics: results.box.map (mAP50-95), results.box.map50, etc.
+    val_results = eval_model.val(
+        data=args.data,
+        imgsz=args.imgsz,
+        device=yolo_device_arg,
+        split="val",
         verbose=True,
     )
 
-    # --------------------------------------------------------
-    # Evaluación
-    # --------------------------------------------------------
-    print("\n[INFO] Evaluando en conjunto de validación...")
-    metrics = model.val(
-        data=args.data,
-        imgsz=args.img_size,
-        batch=args.batch_size,
-        device=device_str,
-    )
+    map_50 = None
+    map_50_95 = None
+    try:
+        map_50 = float(val_results.box.map50)
+        map_50_95 = float(val_results.box.map)
+    except Exception:
+        print("[WARN] No se pudieron extraer map_50 / map_50_95 desde Ultralytics Metrics.")
 
-    box_metrics = getattr(metrics, "box", metrics)
+    test_metrics = {
+        "map_50": map_50,
+        "map_50_95": map_50_95,
+    }
 
-    map50 = float(getattr(box_metrics, "map50", 0.0))
-    map5095 = float(getattr(box_metrics, "map", 0.0))
+    if map_50 is not None and map_50_95 is not None:
+        print(f"[VAL] mAP@0.5: {map_50:.4f} | mAP@0.5:0.95: {map_50_95:.4f}")
+    else:
+        print("[VAL] mAP no disponible (val_results.box.map/map50 faltan)")
 
-    print(f"[VAL] mAP@0.5={map50:.4f} | mAP@0.5:0.95={map5095:.4f}")
-
-    # --------------------------------------------------------
     # Benchmark sintético
-    # --------------------------------------------------------
-    print("\n[INFO] Ejecutando benchmark de inferencia...")
-    benchmark = benchmark_yolov8_model(
-        model=model,
+    print("\n[INFO] Ejecutando benchmark sintético de inferencia YOLOv8s...")
+    benchmark = benchmark_yolo_model(
+        eval_model,
         device=device,
-        img_size=args.img_size,
+        device_name=device_name,
+        imgsz=args.imgsz,
         batch_size=args.batch_size,
-        max_batches=20,
+        warmup=10,
+        runs=50,
     )
 
-    # --------------------------------------------------------
-    # Guardar métricas
-    # --------------------------------------------------------
-    metrics_dict = {
-        "model_name": args.run_name,
+    if benchmark["fps"] is not None:
+        print(
+            f"[BENCHMARK] Device: {benchmark['device_name']} | "
+            f"Latencia media (ms): {benchmark['mean_latency_ms']:.3f} | "
+            f"FPS: {benchmark['fps']:.2f} | "
+            f"VRAM usada (MB): {benchmark['vram_used_mb']:.2f}"
+        )
+    else:
+        print("[BENCHMARK] sin datos")
+
+    # Gráfico resumen de benchmark
+    plot_benchmark_metrics(
+        benchmark,
+        benchmark_fig_path,
+        title=f"Benchmark computacional — {model_name} ({device_name})",
+    )
+    print(f"[INFO] Gráfico de benchmark guardado en: {benchmark_fig_path}")
+
+    # Guardar JSON de métricas unificado
+    metrics: Dict[str, Any] = {
+        "model_name": model_name,
         "task": "detection",
-        "dataset": "coco_yolo",
+        "dataset": args.data,
+        "num_classes": None,   # Ultralytics conoce internamente el nº de clases
         "epochs": args.epochs,
-        "num_classes": getattr(metrics, "nc", None),
-        "test_loss": None,  # YOLO no expone test_loss como un único valor
-        "test_metrics": {
-            "map_50": map50,
-            "map_50_95": map5095,
-        },
+        "best_epoch": None,    # Ultralytics no expone directamente el número de época
+        "device_name": device_name,
+        "device_tag": device_tag,
+        "test_loss": None,     # opcional, Ultralytics puede extraerlo de logs si se desea
+        "test_metrics": test_metrics,
         "benchmark": benchmark,
+        "artifacts": {
+            "best_model_path": str(best_weights) if best_weights.exists() else None,
+            "ultralytics_project_dir": str(yolo_project / yolo_name),
+            "benchmark_summary_png": str(benchmark_fig_path),
+        },
     }
 
     with open(metrics_path, "w") as f:
-        json.dump(metrics_dict, f, indent=4)
+        json.dump(metrics, f, indent=4)
 
-    print(f"[INFO] Métricas guardadas en: {metrics_path}")
+    print(f"[INFO] Métricas YOLOv8s guardadas en: {metrics_path}")
+    print(f"[INFO] Artefactos de Ultralytics disponibles en: {yolo_project / yolo_name}")
 
 
 if __name__ == "__main__":

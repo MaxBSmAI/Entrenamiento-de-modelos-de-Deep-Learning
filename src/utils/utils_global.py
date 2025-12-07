@@ -42,31 +42,65 @@ def find_all_metrics(result_root: Path) -> List[Path]:
 # ============================================================
 
 def parse_any_run(path: Path) -> Dict[str, Any]:
+    """
+    Intenta parsear cualquier *_metrics.json del proyecto de manera robusta.
+
+    Prioriza los campos internos del JSON (task, model_name, benchmark, etc.)
+    y sólo si no están, infiere desde la ruta.
+
+    Compatibles con:
+        - train_resnet50_imagenet.py
+        - train_vit_b16_imagenet.py
+        - train_Faster_R_CNN.py
+        - train_yolov8s_coco.py
+        - futuros scripts de segmentación
+    """
     with open(path, "r") as f:
         data = json.load(f)
 
-    # Detectar la tarea
-    if "classification" in str(path):
-        task = "classification"
-    elif "detection" in str(path):
-        task = "detection"
-    elif "segmentation" in str(path):
-        task = "segmentation"
-    else:
-        task = "unknown"
+    # --- Tarea (task) ---
+    task = data.get("task")
+    if task is None:
+        # Fallback por ruta si no viene en el JSON
+        p_str = str(path)
+        if "classification" in p_str:
+            task = "classification"
+        elif "detection" in p_str:
+            task = "detection"
+        elif "segmentation" in p_str:
+            task = "segmentation"
+        else:
+            task = "unknown"
 
-    # Modelo = carpeta padre
-    model_name = path.parent.name
-    if model_name in ("classification", "detection", "segmentation"):
-        model_name = path.stem.replace("_metrics", "")
+    # --- Nombre del modelo ---
+    model_name = data.get("model_name")
+    if not model_name:
+        # Intentar deducir desde la estructura:
+        #   result/<task>/<model_name>/<device_tag>/<file>
+        parts = path.parts
+        if "result" in parts:
+            i_res = parts.index("result")
+            # parts: [..., "result", <task_dir>, <model_name>, <device_tag>, <file>]
+            if len(parts) > i_res + 2:
+                candidate = parts[i_res + 2]
+                if candidate not in ("classification", "detection", "segmentation", "global"):
+                    model_name = candidate
 
+        # Fallback final: padre o nombre del archivo
+        if not model_name:
+            model_name = path.parent.name
+            if model_name in ("classification", "detection", "segmentation", "global"):
+                model_name = path.stem.replace("_metrics", "")
+
+    # Métricas y benchmark desde el JSON
     test_metrics = data.get("test_metrics", {})
     benchmark = data.get("benchmark", {})
 
-    # Métricas estándar
+    # Métricas estándar de clasificación
     accuracy = test_metrics.get("accuracy")
     f1_macro = test_metrics.get("f1_macro")
 
+    # Métricas de detección (distintos nombres posibles)
     map50 = (
         test_metrics.get("map_50")
         or test_metrics.get("mAP_0.5")
@@ -78,6 +112,7 @@ def parse_any_run(path: Path) -> Dict[str, Any]:
         or test_metrics.get("map@0.5:0.95")
     )
 
+    # Métricas de segmentación
     miou = (
         test_metrics.get("miou")
         or test_metrics.get("mIoU")
@@ -172,11 +207,19 @@ def write_global_csv(runs: List[Dict[str, Any]], out_dir: Path) -> Path:
 
 
 # ============================================================
-# Comparación RTX 4080 vs A100 (globally)
+# Comparación RTX 4080 vs A100 (global)
 # ============================================================
 
 def generate_global_device_comparison(runs: List[Dict[str, Any]], out_dir: Path) -> None:
-    models = {}  # {(task, model): {"RTX 4080": run, "A100": run}}
+    """
+    Genera gráficos comparando RTX 4080 vs A100, por (task, model_name):
+
+        - FPS
+        - Latencia
+        - Throughput
+        - VRAM usada
+    """
+    models: Dict[tuple, Dict[str, Dict[str, Any]]] = {}  # {(task, model): {"RTX 4080": run, "A100": run}}
 
     for r in runs:
         key = (r["task"], r["model_name"])

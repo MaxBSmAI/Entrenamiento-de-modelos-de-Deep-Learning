@@ -1,150 +1,131 @@
 """
 detection_results.py
 
-Script para:
-- Leer todos los *_metrics.json bajo result/detection/.
-- Construir un resumen en CSV.
-- Generar gráficos comparativos de:
-    * Desempeño del modelo (mAP@0.5, mAP@0.5:0.95) entre modelos en un mismo dispositivo.
-    * Desempeño computacional (FPS, latencia, throughput, VRAM) entre:
-        - modelos en un mismo dispositivo;
-        - RTX 4080 vs A100 para cada modelo.
+Resumen y análisis de TODOS los modelos de detección entrenados:
 
-Salida principal en:
-    result/detection/
+    - Faster R-CNN (train_Faster_R_CNN.py)
+    - YOLOv8s (train_yolov8s_coco.py)
 
-Ejecución recomendada desde la raíz del proyecto:
+Procesa estructura:
 
-    export PYTHONPATH=./src
-    python src/detection/detection_results.py
+result/detection/<model_name>/<device_tag>/*_metrics.json
+
+Genera:
+    1) summary_detection_runs.csv
+    2) Gráficos por dispositivo (mAP50, mAP50-95)
+    3) Gráficos comparativos entre dispositivos para cada modelo:
+        - FPS
+        - Latencia (ms)
+        - Throughput
+        - VRAM usada (MB)
 """
 
 from __future__ import annotations
-
 import json
 import csv
 from pathlib import Path
 from typing import Dict, Any, List
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.utils_benchmark import throughput_from_latency
+# Añadir src al sys.path
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from utils.utils_plot import plot_benchmark_comparison
 
 
-# ------------------------------------------------------------
-# Utilidades de lectura
-# ------------------------------------------------------------
+# ============================================================
+# Búsqueda de archivos
+# ============================================================
 
-def find_detection_metrics(result_root: Path) -> List[Path]:
+def find_all_detection_metrics(result_root: Path) -> List[Path]:
     """
-    Busca todos los *_metrics.json bajo result/detection/.
+    Busca recursivamente todos los *_metrics.json dentro de result/detection/.
     """
-    det_root = result_root / "detection"
-    if not det_root.exists():
-        return []
-    return list(det_root.rglob("*_metrics.json"))
+    return list(result_root.rglob("*_metrics.json"))
 
 
-def parse_run_info(path: Path) -> Dict[str, Any]:
+# ============================================================
+# Parseo flexible de cada run de detección
+# ============================================================
+
+def parse_detection_run(path: Path) -> Dict[str, Any]:
     """
-    Parsea un archivo *_metrics.json de DETECCIÓN.
-
-    Estructura esperada (flexible):
-
-    {
-        "test_loss": ...,
-        "test_metrics": {
-            "map_50": ...,
-            "map_50_95": ...,
-            ...
-        },
-        "benchmark": {
-            "device_name": "RTX 4080",
-            "batch_size": ...,
-            "mean_latency_ms": ...,
-            "fps": ...,
-            "vram_used_mb": ...,
-            ...
-        },
-        ...
-    }
+    Carga un JSON de métricas de detección y devuelve un diccionario estándar.
+    Compatible con:
+        - train_Faster_R_CNN.py
+        - train_yolov8s_coco.py
     """
     with open(path, "r") as f:
         data = json.load(f)
 
-    # Nombre de modelo: usamos la carpeta inmediatamente anterior o el stem
-    # Ejemplo: result/detection/detr_coco/detr_coco_metrics.json
-    model_name = path.stem.replace("_metrics", "")
-    if path.parent.name != "detection":
-        model_name = path.parent.name
+    model_name = data.get("model_name", path.parent.name)
+    device_name = data.get("device_name", data.get("benchmark", {}).get("device_name", "unknown"))
+    device_tag = data.get("device_tag", "unknown")
 
-    test_metrics = data.get("test_metrics", {})
-    benchmark = data.get("benchmark", {})
+    dataset = data.get("dataset", "unknown")
+    num_classes = data.get("num_classes", None)
+    epochs = data.get("epochs", None)
+    best_epoch = data.get("best_epoch", None)
 
-    device_name = (benchmark.get("device_name") or benchmark.get("device") or "unknown").strip()
+    # Métricas detección
+    test_metrics = data.get("test_metrics", {}) or {}
+    map_50 = test_metrics.get("map_50")
+    map_50_95 = test_metrics.get("map_50_95")
 
-    mean_latency_ms = benchmark.get("mean_latency_ms")
+    # Benchmark
+    benchmark = data.get("benchmark", {}) or {}
     fps = benchmark.get("fps")
-    vram_used_mb = benchmark.get("vram_used_mb")
-    vram_total_mb = benchmark.get("vram_total_mb")
+    latency = benchmark.get("mean_latency_ms")
     throughput = benchmark.get("throughput")
+    vram_used = benchmark.get("vram_used_mb")
 
-    if throughput is None and mean_latency_ms is not None:
-        batch_size = data.get("batch_size", benchmark.get("batch_size", 1))
-        throughput = throughput_from_latency(batch_size, mean_latency_ms)
-
-    run_info = {
-        "path": str(path),
-        "task": "detection",
+    return {
         "model_name": model_name,
         "device_name": device_name,
-        "test_loss": data.get("test_loss"),
-        "test_metrics": test_metrics,
+        "device_tag": device_tag,
+        "dataset": dataset,
+        "num_classes": num_classes,
+        "epochs": epochs,
+        "best_epoch": best_epoch,
+        "map_50": map_50,
+        "map_50_95": map_50_95,
         "benchmark": {
-            "batch_size": data.get("batch_size", benchmark.get("batch_size")),
-            "img_size": data.get("img_size", benchmark.get("img_size")),
-            "mean_latency_ms": mean_latency_ms,
             "fps": fps,
+            "latency": latency,
             "throughput": throughput,
-            "vram_used_mb": vram_used_mb,
-            "vram_total_mb": vram_total_mb,
-            "flops_g": benchmark.get("flops_g"),
-            "params_m": benchmark.get("params_m"),
-            "power_w": benchmark.get("power_w"),
-            "efficiency_fps_w": benchmark.get("efficiency_fps_w"),
+            "vram_used_mb": vram_used,
         },
+        "path": str(path),
     }
-    return run_info
 
 
-# ------------------------------------------------------------
-# CSV resumen
-# ------------------------------------------------------------
+# ============================================================
+# CSV global
+# ============================================================
 
-def write_detection_csv(runs: List[Dict[str, Any]], det_dir: Path) -> Path:
-    """
-    Escribe un CSV con el resumen de DETECCIÓN.
-    """
-    csv_path = det_dir / "summary_detection_runs.csv"
-    det_dir.mkdir(parents=True, exist_ok=True)
+def write_detection_csv(runs: List[Dict[str, Any]], out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "summary_detection_runs.csv"
 
     fieldnames = [
         "model_name",
         "device_name",
-        "test_loss",
+        "device_tag",
+        "dataset",
+        "num_classes",
+        "epochs",
+        "best_epoch",
         "map_50",
         "map_50_95",
-        "mean_latency_ms",
         "fps",
+        "latency",
         "throughput",
         "vram_used_mb",
-        "vram_total_mb",
-        "flops_g",
-        "params_m",
-        "power_w",
-        "efficiency_fps_w",
         "path",
     ]
 
@@ -153,271 +134,176 @@ def write_detection_csv(runs: List[Dict[str, Any]], det_dir: Path) -> Path:
         writer.writeheader()
 
         for r in runs:
-            tm = r.get("test_metrics", {})
-            bm = r.get("benchmark", {})
+            writer.writerow({
+                "model_name": r["model_name"],
+                "device_name": r["device_name"],
+                "device_tag": r["device_tag"],
+                "dataset": r["dataset"],
+                "num_classes": r["num_classes"],
+                "epochs": r["epochs"],
+                "best_epoch": r["best_epoch"],
+                "map_50": r["map_50"],
+                "map_50_95": r["map_50_95"],
+                "fps": r["benchmark"]["fps"],
+                "latency": r["benchmark"]["latency"],
+                "throughput": r["benchmark"]["throughput"],
+                "vram_used_mb": r["benchmark"]["vram_used_mb"],
+                "path": r["path"],
+            })
 
-            # nombres de métricas flexibles: intentamos encontrar mAP si tiene otro nombre
-            map_50 = tm.get("map_50", tm.get("mAP_0.5", tm.get("map@0.5")))
-            map_50_95 = tm.get(
-                "map_50_95",
-                tm.get("mAP_0.5_0.95", tm.get("map@0.5:0.95")),
-            )
-
-            row = {
-                "model_name": r.get("model_name"),
-                "device_name": r.get("device_name"),
-                "test_loss": r.get("test_loss"),
-                "map_50": map_50,
-                "map_50_95": map_50_95,
-                "mean_latency_ms": bm.get("mean_latency_ms"),
-                "fps": bm.get("fps"),
-                "throughput": bm.get("throughput"),
-                "vram_used_mb": bm.get("vram_used_mb"),
-                "vram_total_mb": bm.get("vram_total_mb"),
-                "flops_g": bm.get("flops_g"),
-                "params_m": bm.get("params_m"),
-                "power_w": bm.get("power_w"),
-                "efficiency_fps_w": bm.get("efficiency_fps_w"),
-                "path": r.get("path"),
-            }
-            writer.writerow(row)
-
-    print(f"[INFO] Resumen de detección escrito en: {csv_path}")
+    print(f"[INFO] CSV detección guardado en: {csv_path}")
     return csv_path
 
 
-# ------------------------------------------------------------
-# Agrupar por dispositivo y por modelo
-# ------------------------------------------------------------
+# ============================================================
+# Gráficos por dispositivo
+# ============================================================
 
-def group_by_device(runs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Agrupa ejecuciones por device_name.
-    """
+def generate_per_device_metric_plots(runs: List[Dict[str, Any]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Agrupar por dispositivo
     by_device: Dict[str, List[Dict[str, Any]]] = {}
     for r in runs:
-        dev = str(r["device_name"])
+        dev = r["device_name"]
         by_device.setdefault(dev, []).append(r)
-    return by_device
+
+    for device_name, dev_runs in by_device.items():
+        dev_runs = sorted(dev_runs, key=lambda x: x["model_name"])
+
+        model_names = [r["model_name"] for r in dev_runs]
+        map50_vals = [r["map_50"] for r in dev_runs]
+        map95_vals = [r["map_50_95"] for r in dev_runs]
+
+        # mAP@0.5
+        valid_pairs = [(m, v) for m, v in zip(model_names, map50_vals) if v is not None]
+        if valid_pairs:
+            names, vals = zip(*valid_pairs)
+            plt.figure(figsize=(8, 4))
+            idx = np.arange(len(names))
+            plt.bar(idx, vals)
+            plt.xticks(idx, names, rotation=45, ha="right")
+            plt.ylabel("mAP@0.5")
+            plt.title(f"mAP@0.5 por modelo — {device_name}")
+            plt.grid(axis="y", linestyle="--", alpha=0.5)
+            path = out_dir / f"map50_by_model_{device_name.replace(' ', '_')}.png"
+            plt.tight_layout()
+            plt.savefig(path, bbox_inches="tight")
+            plt.close()
+            print(f"[INFO] Guardado: {path}")
+
+        # mAP@0.5:0.95
+        valid_pairs = [(m, v) for m, v in zip(model_names, map95_vals) if v is not None]
+        if valid_pairs:
+            names, vals = zip(*valid_pairs)
+            plt.figure(figsize=(8, 4))
+            idx = np.arange(len(names))
+            plt.bar(idx, vals)
+            plt.xticks(idx, names, rotation=45, ha="right")
+            plt.ylabel("mAP@0.5:0.95")
+            plt.title(f"mAP@0.5:0.95 por modelo — {device_name}")
+            plt.grid(axis="y", linestyle="--", alpha=0.5)
+            path = out_dir / f"map5095_by_model_{device_name.replace(' ', '_')}.png"
+            plt.tight_layout()
+            plt.savefig(path, bbox_inches="tight")
+            plt.close()
+            print(f"[INFO] Guardado: {path}")
 
 
-def group_by_model_and_device(
-    runs: List[Dict[str, Any]]
-) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """
-    Agrupa por modelo y, dentro de cada modelo, por dispositivo.
+# ============================================================
+# Comparación entre dispositivos por modelo
+# ============================================================
 
-    Retorna:
-        {
-            "detr_coco": {
-                "RTX 4080": run_info,
-                "A100": run_info,
-            },
-            "yolov8s_coco": {
-                ...
-            }
-        }
-    """
-    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+def generate_device_comparisons(runs: List[Dict[str, Any]], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Agrupar por modelo
+    by_model: Dict[str, List[Dict[str, Any]]] = {}
     for r in runs:
-        m = r["model_name"]
-        d = str(r["device_name"])
-        out.setdefault(m, {})[d] = r
-    return out
-
-
-# ------------------------------------------------------------
-# Gráficos auxiliares
-# ------------------------------------------------------------
-
-def plot_metric_across_models(
-    runs: List[Dict[str, Any]],
-    metric_key: str,
-    metric_source: str,
-    device_name: str,
-    save_path: Path,
-    title: str,
-) -> None:
-    """
-    Grafica una métrica (map_50, fps, etc.) entre modelos
-    para un mismo dispositivo.
-
-    metric_source:
-        - "test_metrics"
-        - "benchmark"
-    metric_key:
-        - p.ej. "map_50", "map_50_95", "fps", "mean_latency_ms", ...
-    """
-    names: List[str] = []
-    values: List[float] = []
-
-    for r in runs:
-        if str(r["device_name"]) != device_name:
-            continue
-
-        if metric_source == "test_metrics":
-            tm = r["test_metrics"]
-
-            # para mAP, aceptamos alias
-            if metric_key == "map_50":
-                v = tm.get("map_50", tm.get("mAP_0.5", tm.get("map@0.5")))
-            elif metric_key == "map_50_95":
-                v = tm.get("map_50_95", tm.get("mAP_0.5_0.95", tm.get("map@0.5:0.95")))
-            else:
-                v = tm.get(metric_key)
-        else:
-            v = r["benchmark"].get(metric_key)
-
-        if v is None:
-            continue
-
-        names.append(r["model_name"])
-        values.append(float(v))
-
-    if not names:
-        return
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    plt.figure(figsize=(8, 4))
-    idx = np.arange(len(names))
-    plt.bar(idx, values)
-    plt.xticks(idx, names, rotation=45, ha="right")
-    plt.ylabel(metric_key)
-    plt.title(f"{title} ({device_name})")
-    plt.grid(axis="y", linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print(f"[INFO] Gráfico guardado: {save_path}")
-
-
-def generate_model_vs_model_plots(
-    runs: List[Dict[str, Any]],
-    det_dir: Path,
-) -> None:
-    """
-    Genera gráficos de:
-      - mAP@0.5 entre modelos en cada dispositivo
-      - mAP@0.5:0.95 entre modelos en cada dispositivo
-      - FPS entre modelos en cada dispositivo
-      - Latencia entre modelos en cada dispositivo
-    """
-    by_device = group_by_device(runs)
-
-    for device_name, runs_dev in by_device.items():
-        # desempeño (mAP)
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="map_50",
-            metric_source="test_metrics",
-            device_name=device_name,
-            save_path=det_dir / f"detection_map50_{device_name}.png",
-            title="mAP@0.5 por modelo",
-        )
-
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="map_50_95",
-            metric_source="test_metrics",
-            device_name=device_name,
-            save_path=det_dir / f"detection_map50_95_{device_name}.png",
-            title="mAP@0.5:0.95 por modelo",
-        )
-
-        # computacional
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="fps",
-            metric_source="benchmark",
-            device_name=device_name,
-            save_path=det_dir / f"detection_benchmark_fps_{device_name}.png",
-            title="FPS por modelo",
-        )
-
-        plot_metric_across_models(
-            runs_dev,
-            metric_key="mean_latency_ms",
-            metric_source="benchmark",
-            device_name=device_name,
-            save_path=det_dir / f"detection_benchmark_latency_ms_{device_name}.png",
-            title="Latencia (ms) por modelo",
-        )
-
-
-def generate_4080_vs_a100_plots(
-    runs: List[Dict[str, Any]],
-    det_dir: Path,
-    device_a: str = "RTX 4080",
-    device_b: str = "A100",
-) -> None:
-    """
-    Para cada modelo, genera comparación RTX 4080 vs A100
-    para FPS, latencia, throughput y VRAM.
-    """
-    models = group_by_model_and_device(runs)
+        by_model.setdefault(r["model_name"], []).append(r)
 
     metrics_to_compare = [
         ("fps", "FPS"),
-        ("mean_latency_ms", "Latencia (ms)"),
+        ("latency", "Latencia (ms)"),
         ("throughput", "Throughput (samples/s)"),
         ("vram_used_mb", "VRAM usada (MB)"),
     ]
 
-    for model_name, by_dev in models.items():
-        if device_a not in by_dev or device_b not in by_dev:
-            continue
+    for model_name, model_runs in by_model.items():
+        devices_present = sorted(set(r["device_name"] for r in model_runs))
+        if len(devices_present) < 2:
+            continue  # no hay comparación posible
 
-        bm_a = by_dev[device_a]["benchmark"]
-        bm_b = by_dev[device_b]["benchmark"]
-
-        benchmarks_dict = {
-            device_a: bm_a,
-            device_b: bm_b,
+        benchmarks_by_device = {
+            r["device_name"]: r["benchmark"] for r in model_runs
         }
 
-        for metric_key, label in metrics_to_compare:
-            if bm_a.get(metric_key) is None or bm_b.get(metric_key) is None:
+        for key, label in metrics_to_compare:
+            non_null_count = sum(
+                1 for bm in benchmarks_by_device.values()
+                if key in bm and bm[key] is not None
+            )
+            if non_null_count < 2:
                 continue
 
-            filename = f"{model_name}_{metric_key}_RTX4080_vs_A100.png"
-            save_path = det_dir / filename
+            save_path = out_dir / f"{model_name}_{key}_by_device.png"
 
             plot_benchmark_comparison(
-                benchmarks=benchmarks_dict,
-                metric_key=metric_key,
+                benchmarks_by_device,
+                metric_key=key,
                 save_path=save_path,
-                title=f"{label}: {model_name} (RTX 4080 vs A100)",
+                title=f"{model_name} — {label} por dispositivo",
             )
 
-            print(f"[INFO] Gráfico guardado: {save_path}")
+            print(f"[INFO] Comparación guardada: {save_path}")
 
 
-# ------------------------------------------------------------
-# main
-# ------------------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
-    # src/detection/detection_results.py → project_root 2 niveles arriba
     project_root = Path(__file__).resolve().parents[2]
-    result_root = project_root / "result"
-    det_dir = result_root / "detection"
+    detect_root = project_root / "result" / "detection"
+    global_dir = detect_root / "global"
 
-    metric_files = find_detection_metrics(result_root)
+    metric_files = find_all_detection_metrics(detect_root)
     if not metric_files:
         print("[WARN] No se encontraron *_metrics.json en result/detection/")
         return
 
-    runs = [parse_run_info(p) for p in metric_files]
+    print(f"[INFO] {len(metric_files)} archivos de métricas encontrados.")
 
-    # 1) CSV resumen
-    write_detection_csv(runs, det_dir)
+    runs: List[Dict[str, Any]] = []
+    for p in metric_files:
+        try:
+            r = parse_detection_run(p)
+            # Asegurar que sea detección
+            try:
+                dd = json.load(open(p))
+                if dd.get("task", None) != "detection":
+                    continue
+            except Exception:
+                pass
 
-    # 2) Comparaciones entre modelos (mismo dispositivo)
-    generate_model_vs_model_plots(runs, det_dir)
+            runs.append(r)
+        except Exception as e:
+            print(f"[WARN] Error procesando {p}: {e}")
 
-    # 3) Comparaciones RTX 4080 vs A100 para cada modelo
-    generate_4080_vs_a100_plots(runs, det_dir, device_a="RTX 4080", device_b="A100")
+    if not runs:
+        print("[WARN] No hay corridas válidas de detección.")
+        return
+
+    # 1) CSV global
+    write_detection_csv(runs, global_dir)
+
+    # 2) Gráficos por dispositivo
+    generate_per_device_metric_plots(runs, global_dir)
+
+    # 3) Comparaciones entre dispositivos (FPS, Latencia, etc.)
+    generate_device_comparisons(runs, global_dir)
+
+    print("\n[INFO] Análisis de detección completado correctamente.")
 
 
 if __name__ == "__main__":
