@@ -27,3 +27,8 @@ pycocotools
 albumentations
 rich
 tensorboard
+
+# ONNX
+onnx
+onnxruntime-gpu
+

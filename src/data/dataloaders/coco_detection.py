@@ -137,7 +137,7 @@ def collate_fn_coco(batch: List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]):
 
 
 def get_coco_detection_dataloaders(
-    batch_size: int = 2,
+    batch_size: int = 4,
     img_size: int = 640,
     streaming: bool = True,
     num_workers: int = 2,
