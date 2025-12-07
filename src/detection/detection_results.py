@@ -5,10 +5,12 @@ Resumen y análisis de TODOS los modelos de detección entrenados:
 
     - Faster R-CNN (train_Faster_R_CNN.py)
     - YOLOv8s (train_yolov8s_coco.py)
+    - RetinaNet (train_retinanet_coco.py)
+    - Cualquier otro modelo que guarde *_metrics.json con task="detection"
 
 Procesa estructura:
 
-result/detection/<model_name>/<device_tag>/*_metrics.json
+    result/detection/<model_name>/*_metrics.json
 
 Genera:
     1) summary_detection_runs.csv
@@ -21,6 +23,7 @@ Genera:
 """
 
 from __future__ import annotations
+
 import json
 import csv
 from pathlib import Path
@@ -59,12 +62,16 @@ def parse_detection_run(path: Path) -> Dict[str, Any]:
     Compatible con:
         - train_Faster_R_CNN.py
         - train_yolov8s_coco.py
+        - train_retinanet_coco.py
+        - Otros modelos que respeten la misma convención.
     """
     with open(path, "r") as f:
         data = json.load(f)
 
     model_name = data.get("model_name", path.parent.name)
-    device_name = data.get("device_name", data.get("benchmark", {}).get("device_name", "unknown"))
+
+    benchmark_data = data.get("benchmark", {}) or {}
+    device_name = data.get("device_name", benchmark_data.get("device_name", "unknown"))
     device_tag = data.get("device_tag", "unknown")
 
     dataset = data.get("dataset", "unknown")
@@ -74,11 +81,21 @@ def parse_detection_run(path: Path) -> Dict[str, Any]:
 
     # Métricas detección
     test_metrics = data.get("test_metrics", {}) or {}
-    map_50 = test_metrics.get("map_50")
-    map_50_95 = test_metrics.get("map_50_95")
+    # Para compatibilidad: algunos scripts pueden usar 'map_50', otros 'mAP50'
+    map_50 = (
+        test_metrics.get("map_50")
+        if "map_50" in test_metrics
+        else test_metrics.get("mAP50")
+    )
+    # Igual para mAP50-95
+    map_50_95 = (
+        test_metrics.get("map_50_95")
+        if "map_50_95" in test_metrics
+        else test_metrics.get("mAP50_95")
+    )
 
     # Benchmark
-    benchmark = data.get("benchmark", {}) or {}
+    benchmark = benchmark_data
     fps = benchmark.get("fps")
     latency = benchmark.get("mean_latency_ms")
     throughput = benchmark.get("throughput")
@@ -232,7 +249,8 @@ def generate_device_comparisons(runs: List[Dict[str, Any]], out_dir: Path) -> No
     for model_name, model_runs in by_model.items():
         devices_present = sorted(set(r["device_name"] for r in model_runs))
         if len(devices_present) < 2:
-            continue  # no hay comparación posible
+            # sin comparación multi-dispositivo
+            continue
 
         benchmarks_by_device = {
             r["device_name"]: r["benchmark"] for r in model_runs
@@ -277,15 +295,12 @@ def main() -> None:
     runs: List[Dict[str, Any]] = []
     for p in metric_files:
         try:
-            r = parse_detection_run(p)
-            # Asegurar que sea detección
-            try:
-                dd = json.load(open(p))
-                if dd.get("task", None) != "detection":
-                    continue
-            except Exception:
-                pass
+            with open(p, "r") as f:
+                dd = json.load(f)
+            if dd.get("task", None) != "detection":
+                continue
 
+            r = parse_detection_run(p)
             runs.append(r)
         except Exception as e:
             print(f"[WARN] Error procesando {p}: {e}")

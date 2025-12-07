@@ -7,13 +7,11 @@ Dataloader para el dataset:
 Características clave:
 - NO necesitas descargar COCO manualmente en tu máquina local.
 - Por defecto usa "streaming=True" para NO almacenar el dataset completo en disco.
-- Permite usar el mismo batch_size = 16 para comparar rendimiento entre GPUs.
 
 El formato de salida es compatible con:
-- Faster R-CNN / RetinaNet / Mask R-CNN
-- Otros modelos de detección de torchvision que esperen:
-    imágenes: lista[Tensor[C,H,W]]
-    targets:  lista[dict(boxes, labels)]
+- Faster R-CNN / RetinaNet / Mask R-CNN de torchvision:
+    imágenes: list[Tensor[C,H,W]]
+    targets:  list[dict(boxes, labels)]
 """
 
 from __future__ import annotations
@@ -56,7 +54,6 @@ class CocoDetectionMapDataset(Dataset):
         if self.transform:
             img = self.transform(img)
 
-        # En detection-datasets/coco, bbox ya está en formato [x_min, y_min, x_max, y_max]
         bboxes = ex["objects"]["bbox"]      # [N, 4]
         labels = ex["objects"]["category"]  # [N]
 
@@ -102,13 +99,16 @@ class CocoDetectionIterableDataset(IterableDataset):
 # ============================================================
 
 
-def build_default_transform():
+def build_default_transform(img_size: int = 640):
     """
     Transformación estándar para detección.
 
-    OJO:
-    - No redimensionamos aquí para no desalinear las bounding boxes.
-    - Faster R-CNN y otros modelos de torchvision aceptan tamaños variables.
+    Opción A (actual): solo ToTensor → deja tamaños originales (lo más típico
+    para Faster R-CNN, que maneja tamaños variables).
+
+    Si quisieras forzar 640x640 en todo, podrías usar:
+        transforms.Resize((img_size, img_size))
+    antes del ToTensor.
     """
     return transforms.Compose(
         [
@@ -119,14 +119,15 @@ def build_default_transform():
 
 def collate_fn_coco(batch: List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]):
     """
-    collate_fn para detección:
+    collate_fn para detección (torchvision):
 
-    - imágenes: Tensor [B, 3, H, W]
+    - imágenes: lista de tensores [3, H_i, W_i]
     - targets:  lista de diccionarios
+
+    NO se hace torch.stack, porque las imágenes pueden tener tamaños distintos.
     """
     images = [b[0] for b in batch]
     targets = [b[1] for b in batch]
-    images = torch.stack(images, dim=0)
     return images, targets
 
 
@@ -136,7 +137,8 @@ def collate_fn_coco(batch: List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]):
 
 
 def get_coco_detection_dataloaders(
-    batch_size: int = 16,
+    batch_size: int = 2,
+    img_size: int = 640,
     streaming: bool = True,
     num_workers: int = 2,
 ):
@@ -144,17 +146,10 @@ def get_coco_detection_dataloaders(
     Retorna:
         train_loader, val_loader, num_classes
 
-    Parámetros
-    ----------
-    batch_size : int
-        Tamaño de batch para todos los modelos de detección.
-    streaming : bool
-        True  → Usa IterableDataset desde HuggingFace (no descarga todo).
-        False → Usa Dataset map-style (requiere almacenamiento en el contenedor).
-    num_workers : int
-        Número de workers para DataLoader en modo no streaming.
+    batch_size:
+        - Para Faster R-CNN en COCO, valores típicos son 2–4 por GPU dependiendo de VRAM.
     """
-    transform = build_default_transform()
+    transform = build_default_transform(img_size=img_size)
 
     if streaming:
         # -------------------------
@@ -173,7 +168,7 @@ def get_coco_detection_dataloaders(
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            num_workers=0,
+            num_workers=0,        # IterableDataset → num_workers=0
             collate_fn=collate_fn_coco,
         )
         val_loader = DataLoader(
@@ -220,13 +215,13 @@ def get_coco_detection_dataloaders(
 if __name__ == "__main__":
     # Pequeña prueba rápida
     train_loader, val_loader, num_classes = get_coco_detection_dataloaders(
-        batch_size=8,
+        batch_size=2,
+        img_size=640,
         streaming=True,
     )
 
     print("Número de clases:", num_classes)
     images, targets = next(iter(train_loader))
-    print("Batch imágenes:", images.shape)
+    print("Len batch imágenes:", len(images))
+    print("Tamaño imagen 0:", images[0].shape)
     print("Ejemplo target keys:", targets[0].keys())
-    print("Boxes shape:", targets[0]["boxes"].shape)
-    print("Labels shape:", targets[0]["labels"].shape)
