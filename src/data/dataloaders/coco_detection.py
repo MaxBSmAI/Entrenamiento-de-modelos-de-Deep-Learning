@@ -26,6 +26,53 @@ from PIL import Image
 
 
 # ============================================================
+#  FUNCIONES AUXILIARES
+# ============================================================
+
+def _sanitize_boxes_and_labels(
+    bboxes: Any,
+    labels: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Recibe bboxes y labels (listas o tensores) y:
+
+    - Convierte a tensores.
+    - Asegura shape (N, 4).
+    - Filtra cajas degeneradas:
+        * x_max > x_min
+        * y_max > y_min
+        * valores finitos (no NaN / Inf)
+    """
+    boxes = torch.as_tensor(bboxes, dtype=torch.float32)
+    labels = torch.as_tensor(labels, dtype=torch.int64)
+
+    if boxes.ndim == 1:
+        # Caso raro: una sola caja [4] -> [1, 4]
+        boxes = boxes.unsqueeze(0)
+
+    if boxes.numel() == 0:
+        # Sin cajas, devolvemos tensores vacíos consistentes
+        return boxes.reshape(0, 4), labels.reshape(0)
+
+    # Se asume formato [x_min, y_min, x_max, y_max]
+    x_min = boxes[:, 0]
+    y_min = boxes[:, 1]
+    x_max = boxes[:, 2]
+    y_max = boxes[:, 3]
+
+    valid = (x_max > x_min) & (y_max > y_min)
+
+    # Por seguridad, filtramos también cajas con valores no finitos
+    finite_mask = torch.isfinite(boxes).all(dim=1)
+    valid = valid & finite_mask
+
+    boxes = boxes[valid]
+    labels = labels[valid]
+
+    return boxes, labels
+
+
+# ============================================================
 #  DATASETS AUXILIARES
 # ============================================================
 
@@ -57,8 +104,8 @@ class CocoDetectionMapDataset(Dataset):
         bboxes = ex["objects"]["bbox"]      # [N, 4]
         labels = ex["objects"]["category"]  # [N]
 
-        boxes = torch.tensor(bboxes, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.int64)
+        # --- NUEVO: limpieza de cajas inválidas ---
+        boxes, labels = _sanitize_boxes_and_labels(bboxes, labels)
 
         target = {"boxes": boxes, "labels": labels}
         return img, target
@@ -87,8 +134,8 @@ class CocoDetectionIterableDataset(IterableDataset):
             bboxes = ex["objects"]["bbox"]
             labels = ex["objects"]["category"]
 
-            boxes = torch.tensor(bboxes, dtype=torch.float32)
-            labels = torch.tensor(labels, dtype=torch.int64)
+            # --- NUEVO: limpieza de cajas inválidas ---
+            boxes, labels = _sanitize_boxes_and_labels(bboxes, labels)
 
             target = {"boxes": boxes, "labels": labels}
             yield img, target
