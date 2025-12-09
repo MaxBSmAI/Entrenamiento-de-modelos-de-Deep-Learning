@@ -420,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Train Faster R-CNN on COCO")
 
     parser.add_argument("--epochs", type=int, default=35)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=5)
