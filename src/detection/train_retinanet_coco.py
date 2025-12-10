@@ -3,20 +3,18 @@ train_retinanet_coco.py
 
 Entrena RetinaNet (ResNet50-FPN v2) en COCO Detection usando HuggingFace.
 
-Salida:
-- Mejor modelo por val_loss (early stopping)
-- JSON con:
-    * test_loss
-    * test_metrics: map_50
-    * benchmark: latencia, fps, throughput, VRAM, params
-- Carpeta con todos los artefactos bajo:
-    result/detection/retinanet_coco/
+Incluye:
+- max_steps_per_epoch (Estrategia B)
+- iterador global para entrenamiento parcial
+- Early stopping
+- mAP@0.5 simplificado
+- Benchmark de inferencia
+- Guardado json con device_name, metrics, benchmark
 
-Ejecución recomendada desde la raíz del proyecto:
-
+Ejecución recomendada:
     cd /workspace
     export PYTHONPATH=./src
-    python src/detection/train_retinanet_coco.py --streaming True
+    python src/detection/train_retinanet_coco.py --streaming True --max_steps_per_epoch 100
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Dict, Any, Iterator, Optional, Tuple
 import sys
 
 import torch
@@ -49,13 +48,12 @@ from data.dataloaders import get_coco_detection_dataloaders
 
 
 # ============================================================
-# utilidades varias
+# Utils
 # ============================================================
 
 def set_seed(seed: int = 42):
     import random
     import numpy as np
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -66,20 +64,26 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = str(v).lower()
+    if v in ("yes","y","true","t","1"):
+        return True
+    if v in ("no","n","false","f","0"):
+        return False
+    raise argparse.ArgumentTypeError(f"Valor booleano inválido: {v}")
+
+
 def build_model(num_classes: int, pretrained: bool = True):
     """
-    Crea RetinaNet ResNet50-FPN v2.
-
-    - Si pretrained=True: usa pesos COCO (91 clases originales).
-      *NO* se fuerza num_classes para aprovechar el backbone preentrenado.
-    - Si pretrained=False: modelo desde cero con num_classes (típicamente 80).
+    RetinaNet ResNet50-FPN v2.
     """
     if pretrained:
         weights = RetinaNet_ResNet50_FPN_V2_Weights.COCO_V1
-        model = retinanet_resnet50_fpn_v2(weights=weights)  # num_classes=91
+        model = retinanet_resnet50_fpn_v2(weights=weights)   # num_classes=91
     else:
         model = retinanet_resnet50_fpn_v2(weights=None, num_classes=num_classes)
-
     return model
 
 
@@ -90,87 +94,76 @@ def to_device_detection_batch(images, targets, device):
 
 
 # ============================================================
-# mAP@0.5 simple
+# mAP@0.5
 # ============================================================
 
 def box_iou(boxes1, boxes2):
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return torch.zeros((boxes1.size(0), boxes2.size(0)))
 
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    area1 = (boxes1[:,2] - boxes1[:,0]) * (boxes1[:,3] - boxes1[:,1])
+    area2 = (boxes2[:,2] - boxes2[:,0]) * (boxes2[:,3] - boxes2[:,1])
 
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    lt = torch.max(boxes1[:,None,:2], boxes2[:,:2])
+    rb = torch.min(boxes1[:,None,2:], boxes2[:,2:])
 
     wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    union = area1[:, None] + area2 - inter
+    inter = wh[:,:,0] * wh[:,:,1]
+    union = area1[:,None] + area2 - inter
 
     return inter / union.clamp(min=1e-6)
 
 
-def compute_map_50(predictions, ground_truths, num_classes: int):
-    """
-    mAP@0.5 MUY simplificado (una sola IoU=0.5, sin recalls fijos).
-    predictions: lista de dicts {boxes, scores, labels}
-    ground_truths: lista de dicts {boxes, labels}
-    """
+def compute_map_50(predictions, ground_truths, num_classes:int):
     aps = []
 
     for cls in range(num_classes):
         cls_preds = []
         cls_gts = {}
 
-        # recolectar preds y gts para la clase cls
-        for img_id, (pred, gt) in enumerate(zip(predictions, ground_truths)):
-            # pred
+        for img_idx, (pred, gt) in enumerate(zip(predictions, ground_truths)):
             mask_p = pred["labels"] == cls
             if mask_p.any():
-                boxes_p = pred["boxes"][mask_p]
-                scores_p = pred["scores"][mask_p]
-                for b, s in zip(boxes_p, scores_p):
+                p_boxes = pred["boxes"][mask_p]
+                p_scores = pred["scores"][mask_p]
+                for b, s in zip(p_boxes, p_scores):
                     cls_preds.append({
-                        "img_id": img_id,
+                        "img_id": img_idx,
                         "box": b,
                         "score": float(s),
                     })
 
-            # gts
             mask_g = gt["labels"] == cls
             if mask_g.any():
-                boxes_g = gt["boxes"][mask_g]
-                cls_gts.setdefault(img_id, [])
-                for b in boxes_g:
-                    cls_gts[img_id].append({
-                        "box": b,
-                        "matched": False,
-                    })
+                boxes = gt["boxes"][mask_g]
+                cls_gts.setdefault(img_idx, [])
+                for b in boxes:
+                    cls_gts[img_idx].append({"box": b, "matched": False})
 
         if len(cls_preds) == 0:
             continue
 
-        # ordenar por score desc
         cls_preds.sort(key=lambda x: x["score"], reverse=True)
 
         tp = []
         fp = []
+
         for pred in cls_preds:
             img_id = pred["img_id"]
-            box_p = pred["box"].unsqueeze(0)
+            pred_box = pred["box"].unsqueeze(0)
 
-            gts_img = cls_gts.get(img_id, [])
-            if not gts_img:
+            gts = cls_gts.get(img_id, [])
+            if not gts:
                 tp.append(0.0)
                 fp.append(1.0)
                 continue
 
-            gt_boxes = torch.stack([g["box"] for g in gts_img], dim=0)
-            ious = box_iou(box_p, gt_boxes).squeeze(0)
+            gt_boxes = torch.stack([g["box"] for g in gts], dim=0)
+            ious = box_iou(pred_box, gt_boxes).squeeze(0)
 
             best_iou, best_idx = ious.max(0)
-            if best_iou >= 0.5 and not gts_img[best_idx]["matched"]:
-                gts_img[best_idx]["matched"] = True
+            if best_iou >= 0.5 and not gts[best_idx]["matched"]:
+                gts[best_idx]["matched"] = True
                 tp.append(1.0)
                 fp.append(0.0)
             else:
@@ -184,33 +177,72 @@ def compute_map_50(predictions, ground_truths, num_classes: int):
         if gt_total == 0:
             continue
 
-        cum_tp = torch.cumsum(tp, 0)
-        cum_fp = torch.cumsum(fp, 0)
+        cum_tp = torch.cumsum(tp,0)
+        cum_fp = torch.cumsum(fp,0)
 
         recall = cum_tp / gt_total
         precision = cum_tp / (cum_tp + cum_fp).clamp(min=1e-6)
 
         ap = 0.0
         prev_r = 0.0
-        for p, r in zip(precision, recall):
-            ap += float(p) * max(float(r) - prev_r, 0)
+        for p,r in zip(precision, recall):
+            ap += float(p) * max(float(r)-prev_r,0)
             prev_r = float(r)
 
         aps.append(ap)
 
-    return float(sum(aps) / len(aps)) if aps else 0.0
+    return float(sum(aps)/len(aps)) if aps else 0.0
 
 
 # ============================================================
-# loops de entrenamiento / evaluación
+# TRAINING — ESTRATEGIA B
 # ============================================================
 
-def train_one_epoch(model, loader: DataLoader, optimizer, device: torch.device):
+def train_one_epoch(
+    model,
+    loader: DataLoader,
+    optimizer,
+    device,
+    max_steps_per_epoch: Optional[int] = None,
+    train_iter: Optional[Iterator] = None
+):
+    """
+    - max_steps_per_epoch = None → usa todo el loader (modo clásico)
+    - max_steps_per_epoch = N    → consume N batches usando iterador global
+    """
     model.train()
     loss_sum = 0.0
-    batches = 0
 
-    for images, targets in loader:
+    # Caso clásico → recorre todo el DataLoader
+    if max_steps_per_epoch is None:
+        batches = 0
+        for images, targets in loader:
+            imgs, tgts = to_device_detection_batch(images, targets, device)
+
+            losses_dict = model(imgs, tgts)
+            loss = sum(losses_dict.values())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+            batches += 1
+
+        return loss_sum / max(1,batches), None
+
+    # Estrategia B → N batches por época
+    if train_iter is None:
+        train_iter = iter(loader)
+
+    steps = 0
+    while steps < max_steps_per_epoch:
+        try:
+            images, targets = next(train_iter)
+        except StopIteration:
+            train_iter = iter(loader)
+            images, targets = next(train_iter)
+
         imgs, tgts = to_device_detection_batch(images, targets, device)
 
         losses_dict = model(imgs, tgts)
@@ -221,29 +253,30 @@ def train_one_epoch(model, loader: DataLoader, optimizer, device: torch.device):
         optimizer.step()
 
         loss_sum += loss.item()
-        batches += 1
+        steps += 1
 
-    return loss_sum / max(1, batches)
+    return loss_sum / max(1, steps), train_iter
 
+
+# ============================================================
+# evaluación
+# ============================================================
 
 @torch.no_grad()
 def evaluate_loss(model, loader: DataLoader, device: torch.device):
     model.train()
     total = 0.0
     batches = 0
-
     for images, targets in loader:
         imgs, tgts = to_device_detection_batch(images, targets, device)
         loss = sum(model(imgs, tgts).values())
         total += loss.item()
         batches += 1
-
     return total / max(1, batches)
 
 
 @torch.no_grad()
-def evaluate_map(model, loader: DataLoader, device: torch.device,
-                 num_classes: int, max_batches: int = 50):
+def evaluate_map(model, loader: DataLoader, device: torch.device, num_classes:int, max_batches=50):
     model.eval()
     preds, gts = [], []
 
@@ -253,7 +286,7 @@ def evaluate_map(model, loader: DataLoader, device: torch.device,
 
         outputs = model([img.to(device) for img in images])
 
-        for o, t in zip(outputs, targets):
+        for o,t in zip(outputs, targets):
             preds.append({
                 "boxes": o["boxes"].cpu(),
                 "scores": o["scores"].cpu(),
@@ -272,14 +305,14 @@ def evaluate_map(model, loader: DataLoader, device: torch.device,
 # ============================================================
 
 class EarlyStopping:
-    def __init__(self, patience: int = 5, min_delta: float = 0.0):
+    def __init__(self, patience=5, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.best = None
         self.counter = 0
         self.should_stop = False
 
-    def step(self, val: float):
+    def step(self, val):
         if self.best is None or (self.best - val) > self.min_delta:
             self.best = val
             self.counter = 0
@@ -294,12 +327,19 @@ class EarlyStopping:
 # ============================================================
 
 @torch.no_grad()
-def benchmark_detection_model(model, loader: DataLoader, device: torch.device,
-                              max_batches: int = 20):
+def benchmark_detection_model(
+    model,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches=20
+):
     model.eval()
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+        dev_name = torch.cuda.get_device_name(0)
+    else:
+        dev_name = "CPU"
 
     total_time = 0.0
     total_images = 0
@@ -313,19 +353,17 @@ def benchmark_detection_model(model, loader: DataLoader, device: torch.device,
 
         if device.type == "cuda":
             torch.cuda.synchronize()
-        start = time.time()
+        t0 = time.time()
 
         _ = model(imgs)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
-        end = time.time()
+        t1 = time.time()
 
-        total_time += (end - start)
+        total_time += (t1 - t0)
         total_images += len(imgs)
         batches += 1
-
-    dev_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
 
     if batches == 0 or total_time == 0:
         return {
@@ -341,18 +379,10 @@ def benchmark_detection_model(model, loader: DataLoader, device: torch.device,
     latency = (total_time / batches) * 1000.0
     fps = total_images / total_time
 
-    vram_used = (
-        torch.cuda.max_memory_allocated() / (1024 ** 2)
-        if device.type == "cuda"
-        else None
-    )
-    total_vram = (
-        torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
-        if device.type == "cuda"
-        else None
-    )
+    vram_used = torch.cuda.max_memory_allocated()/(1024**2) if device.type=="cuda" else None
+    total_vram = torch.cuda.get_device_properties(0).total_memory/(1024**2) if device.type=="cuda" else None
 
-    params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    params_m = sum(p.numel() for p in model.parameters())/1e6
 
     return {
         "device_name": dev_name,
@@ -380,11 +410,19 @@ def parse_args():
     parser.add_argument("--min_delta", type=float, default=0.0)
     parser.add_argument("--run_name", type=str, default="retinanet_coco")
     parser.add_argument("--no_pretrained", action="store_true")
+
     parser.add_argument(
         "--streaming",
-        type=str,
-        default="True",
-        help="True = cargar COCO vía HuggingFace streaming; False = map-style",
+        type=str2bool,
+        default=True,
+        help="True = HuggingFace streaming; False = map-style",
+    )
+
+    parser.add_argument(
+        "--max_steps_per_epoch",
+        type=int,
+        default=1000,
+        help="Número de batches por época lógica (<=0 usa todo el DataLoader)",
     )
     return parser.parse_args()
 
@@ -400,8 +438,12 @@ def main():
 
     print(f"[INFO] Dispositivo: {device}")
     print(f"[INFO] streaming={args.streaming}")
+    print(f"[INFO] max_steps_per_epoch={args.max_steps_per_epoch}")
 
-    # carpetas de salida
+    if args.max_steps_per_epoch is not None and args.max_steps_per_epoch <= 0:
+        args.max_steps_per_epoch = None
+
+    # carpetas
     project_root = Path(__file__).resolve().parents[2]
     result_root = project_root / "result" / "detection"
     run_dir = result_root / args.run_name
@@ -413,11 +455,8 @@ def main():
     # dataloaders
     train_loader, val_loader, num_classes = get_coco_detection_dataloaders(
         batch_size=args.batch_size,
-        streaming=args.streaming.lower() == "true",
+        streaming=args.streaming,
     )
-
-    # test_loader = validación (no hay test real separado)
-    test_loader = val_loader
 
     print(f"[INFO] Número de clases COCO: {num_classes}")
 
@@ -425,24 +464,37 @@ def main():
     model = build_model(num_classes, pretrained=not args.no_pretrained)
     model.to(device)
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    early = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+    early = EarlyStopping(args.patience, args.min_delta)
 
     best_val_loss = float("inf")
     best_epoch = -1
 
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-    }
+    history = {"train_loss": [], "val_loss": []}
+
+    # Estrategia B → iterador global
+    train_iter: Optional[Iterator] = None
+    if args.max_steps_per_epoch is not None:
+        train_iter = iter(train_loader)
 
     # entrenamiento
     for epoch in range(1, args.epochs + 1):
         print(f"\n[Epoch {epoch}/{args.epochs}]")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
+        if args.max_steps_per_epoch is None:
+            train_loss, _ = train_one_epoch(
+                model, train_loader, optimizer, device,
+                max_steps_per_epoch=None,
+                train_iter=None
+            )
+        else:
+            train_loss, train_iter = train_one_epoch(
+                model, train_loader, optimizer, device,
+                max_steps_per_epoch=args.max_steps_per_epoch,
+                train_iter=train_iter
+            )
+
         val_loss = evaluate_loss(model, val_loader, device)
 
         history["train_loss"].append(train_loss)
@@ -457,8 +509,10 @@ def main():
             best_epoch = epoch
             early.counter = 0
             torch.save(model.state_dict(), model_path)
+            print(f"[INFO] Mejor modelo guardado en {model_path}")
         else:
             early.step(val_loss)
+            print(f"[INFO] EarlyStopping {early.counter}/{args.patience}")
 
         if early.should_stop:
             print("[INFO] Early stopping activado.")
@@ -467,12 +521,12 @@ def main():
     # cargar mejor modelo
     model.load_state_dict(torch.load(model_path, map_location=device))
 
-    # evaluación test
-    test_loss = evaluate_loss(model, test_loader, device)
-    test_metrics = evaluate_map(model, test_loader, device, num_classes)
+    # test
+    test_loss = evaluate_loss(model, val_loader, device)
+    test_metrics = evaluate_map(model, val_loader, device, num_classes)
 
     # benchmark
-    benchmark = benchmark_detection_model(model, test_loader, device)
+    benchmark = benchmark_detection_model(model, val_loader, device)
 
     # guardar JSON
     metrics = {
@@ -486,12 +540,13 @@ def main():
         "test_loss": float(test_loss),
         "test_metrics": test_metrics,
         "benchmark": benchmark,
+        "device_name": benchmark.get("device_name"),
     }
 
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=4)
 
-    print(f"[OK] Métricas guardadas en: {metrics_path}")
+    print(f"[OK] Métricas guardadas en {metrics_path}")
 
 
 if __name__ == "__main__":

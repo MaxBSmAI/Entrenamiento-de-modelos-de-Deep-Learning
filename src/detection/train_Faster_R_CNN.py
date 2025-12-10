@@ -22,7 +22,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Iterator, Optional, Tuple
 import sys
 
 import torch
@@ -229,12 +229,53 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: optim.Optimizer,
     device: torch.device,
-) -> float:
+    max_steps_per_epoch: Optional[int] = None,
+    train_iter: Optional[Iterator] = None,
+) -> Tuple[float, Optional[Iterator]]:
+    """
+    Entrena el modelo por una época lógica.
+
+    - Si max_steps_per_epoch es None:
+        Recorre el loader completo (comportamiento clásico).
+    - Si max_steps_per_epoch es un entero:
+        Usa un iterador global (train_iter) y consume exactamente
+        max_steps_per_epoch batches, reiniciando el iterador cuando
+        se llega al final del DataLoader (StopIteration).
+    """
     model.train()
     loss_sum = 0.0
-    batches = 0
 
-    for images, targets in loader:
+    # Caso 1: época clásica con todo el DataLoader
+    if max_steps_per_epoch is None:
+        batches = 0
+        for images, targets in loader:
+            imgs, tgts = to_device_detection_batch(images, targets, device)
+
+            losses = model(imgs, tgts)
+            loss = sum(losses.values())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+            batches += 1
+
+        return loss_sum / max(1, batches), None
+
+    # Caso 2: época con número fijo de steps usando iterador global
+    if train_iter is None:
+        train_iter = iter(loader)
+
+    steps = 0
+    while steps < max_steps_per_epoch:
+        try:
+            images, targets = next(train_iter)
+        except StopIteration:
+            # Si se acaba el dataset/stream, reiniciamos el iterador
+            train_iter = iter(loader)
+            images, targets = next(train_iter)
+
         imgs, tgts = to_device_detection_batch(images, targets, device)
 
         losses = model(imgs, tgts)
@@ -245,9 +286,10 @@ def train_one_epoch(
         optimizer.step()
 
         loss_sum += loss.item()
-        batches += 1
+        steps += 1
 
-    return loss_sum / max(1, batches)
+    avg_loss = loss_sum / max(1, steps)
+    return avg_loss, train_iter
 
 
 @torch.no_grad()
@@ -435,6 +477,16 @@ def parse_args() -> argparse.Namespace:
         help="True=usa streaming HuggingFace; False=dataset local/descargado",
     )
 
+    parser.add_argument(
+        "--max_steps_per_epoch",
+        type=int,
+        default=1000,
+        help=(
+            "Número máximo de batches por época lógica. "
+            "Si se pasa 0 o un valor <= 0, se recorre todo el DataLoader."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -449,6 +501,11 @@ def main() -> None:
 
     print(f"[INFO] Dispositivo: {device}")
     print(f"[INFO] streaming={args.streaming}")
+    print(f"[INFO] max_steps_per_epoch={args.max_steps_per_epoch}")
+
+    # Normalizar max_steps_per_epoch: 0 o negativo → None (usar todo el loader)
+    if args.max_steps_per_epoch is not None and args.max_steps_per_epoch <= 0:
+        args.max_steps_per_epoch = None
 
     # carpetas de salida
     project_root = Path(__file__).resolve().parents[2]  # .../workspace
@@ -484,11 +541,36 @@ def main() -> None:
     best_epoch = -1
     history: Dict[str, list[float]] = {"train_loss": [], "val_loss": []}
 
+    # Iterador global para Estrategia B (solo si se limita steps)
+    train_iter: Optional[Iterator] = None
+    if args.max_steps_per_epoch is not None:
+        train_iter = iter(train_loader)
+
     # entrenamiento
     for epoch in range(1, args.epochs + 1):
         print(f"\n[Epoch {epoch}/{args.epochs}]")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
+        if args.max_steps_per_epoch is None:
+            # Época clásica: recorre todo el DataLoader
+            train_loss, _ = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                max_steps_per_epoch=None,
+                train_iter=None,
+            )
+        else:
+            # Estrategia B:  N batches por época sobre un iterador global
+            train_loss, train_iter = train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                max_steps_per_epoch=args.max_steps_per_epoch,
+                train_iter=train_iter,
+            )
+
         val_loss = evaluate_loss(model, val_loader, device)
 
         history["train_loss"].append(train_loss)
@@ -567,6 +649,7 @@ def main() -> None:
         "test_loss": float(test_loss),
         "test_metrics": test_metrics,
         "benchmark": benchmark,
+        "device_name": benchmark.get("device_name"),  # para onnx_results / análisis global
     }
 
     with open(metrics_path, "w") as f:
