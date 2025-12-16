@@ -1,230 +1,192 @@
-# src/onnx/onnx_results.py
-
 from __future__ import annotations
 
 """
 onnx_results.py
 
 Integra resultados de:
-    - PyTorch (benchmarks incluidos en *_metrics.json)
-    - ONNX Runtime (benchmark_onnx_runtime.py)
-    - TensorRT (benchmark_tensorrt.py)
+- PyTorch (result/<task>/<model_name>/<device_tag>/<model_name>_metrics.json)
+- ONNX Runtime (models/onnx/**/<onnx_stem>_onnxruntime_benchmark.json)
+- TensorRT (models/onnx/**/<onnx_stem>_tensorrt_bench.json)
 
-Soporta:
-    - Clasificación (ResNet-50, ViT-B/16, ...)
-    - Detección (Faster R-CNN, RetinaNet, ...)
+Objetivos:
+- Normalizar métricas comparables entre RTX 4080 (local) y A100 (server).
+- Generar:
+  - CSV global: models/onnx/global/onnx_backends_summary.csv
+  - Gráficos por (task, model_name, device_tag):
+      - Latencia (ms/batch)
+      - Throughput (samples/s)
 
-Estructuras esperadas:
+Métricas normalizadas (prioridad):
+- latency_ms_per_batch
+- qps_batches
+- throughput_samples_s
 
-1) Métricas PyTorch
-   result/<task>/<model_name>/<device_tag>/<model_name>_metrics.json
-
-   Debe contener algo como:
-       {
-         "model_name": "...",
-         "task": "classification" | "detection",
-         "dataset": "...",
-         "num_classes": ...,
-         "device_name": "...",
-         "device_tag": "...",
-         "benchmark": {
-            "mean_latency_ms": ...,
-            "fps": ...,
-            "throughput": ...,
-            "vram_used_mb": ...,
-            ...
-         },
-         ...
-       }
-
-2) ONNX Runtime
-   benchmark_onnx_runtime.py guarda:
-       <onnx_name>_onnxruntime_benchmark.json
-
-   Ej:
-       models/onnx/classification/resnet50_miniimagenet__RTX_4080_onnxruntime_benchmark.json
-
-   Contiene algo como:
-       {
-         "onnx_model_path": "...",
-         "task": "classification",
-         "batch_size": ...,
-         "num_iterations": ...,
-         "mean_latency_ms": ...,
-         "fps": ...,
-         "throughput": ...,
-         "providers": [...],
-         "note": "..."
-       }
-
-3) TensorRT
-   benchmark_tensorrt.py guarda:
-       <onnx_name>_tensorrt_bench.json
-
-   Ej:
-       models/onnx/classification/resnet50_miniimagenet__RTX_4080_tensorrt_bench.json
-
-   Contiene algo como:
-       {
-          "onnx_path": "...",
-          "task": "classification",
-          "batch_size": ...,
-          "precision": "fp16" | "fp32",
-          "benchmark_tensorrt": {
-              "mean_latency_ms": ...,
-              "throughput": ...,
-              "fps": ...,
-              ...
-          }
-       }
-
-Salida principal:
-    - CSV global:
-        models/onnx/global/onnx_backends_summary.csv
-
-    - Gráficos comparativos por backend (latencia y FPS) por
-      (task, model_name, device_tag) en:
-        models/onnx/global/*.png
+Retrocompatibilidad:
+- Si se detectan campos antiguos:
+  - mean_latency_ms -> latency_ms_per_batch
+  - fps            -> throughput_samples_s (aprox, si representa samples/s)
+  - throughput      -> throughput_samples_s (aprox)
 """
 
 import csv
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
 
 # ============================================================
-# Helpers de rutas / lectura
+# JSON HELPERS
 # ============================================================
 
-SRC_ROOT = Path(__file__).resolve().parents[1]
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-
 def safe_load_json(path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Carga un JSON si existe, devolviendo None en caso de error.
-    """
     if not path.is_file():
         return None
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[WARN] Error al leer JSON {path}: {e}")
+        print(f"[WARN] No se pudo leer JSON {path}: {e}")
         return None
 
 
+# ============================================================
+# ONNX NAME PARSING
+# ============================================================
+
 def parse_onnx_name(onnx_path: Path) -> Tuple[str, str]:
     """
-    A partir del nombre del archivo ONNX:
-        <model_name>__<device_tag>.onnx
-
-    devuelve:
-        model_name, device_tag
-
-    Si no puede parsear, usa heurísticas básicas.
+    ONNX esperado:
+      <model_name>__<device_tag>.onnx
     """
-    stem = onnx_path.stem  # sin extensión
-    # Quitar posibles sufijos añadidos accidentalmente
-    # (ej: si alguien puso .engine o algo raro, nos quedamos con lo antes del primer '.')
+    stem = onnx_path.stem
     if "." in stem:
         stem = stem.split(".", 1)[0]
-
     if "__" in stem:
         model_name, device_tag = stem.split("__", 1)
     else:
-        # fallback: sin device_tag claro
-        model_name = stem
-        device_tag = "UNKNOWN"
+        model_name, device_tag = stem, "UNKNOWN"
     return model_name, device_tag
 
 
 # ============================================================
-# Colectar info PyTorch (baseline)
+# PATH FINDERS
 # ============================================================
 
-def find_pytorch_metrics(
-    project_root: Path,
-    task: str,
-    model_name: str,
-    device_tag: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    Busca el archivo *_metrics.json correspondiente a PyTorch para un modelo dado.
+def find_pytorch_metrics(project_root: Path, task: str, model_name: str, device_tag: str) -> Optional[Dict[str, Any]]:
+    base = project_root / "result" / task / model_name
+    cand1 = base / device_tag / f"{model_name}_metrics.json"
+    cand2 = base / f"{model_name}_metrics.json"
 
-    Rutas probadas:
-        result/<task>/<model_name>/<device_tag>/<model_name>_metrics.json
-        result/<task>/<model_name>/<model_name>_metrics.json
-    """
-    task_root = project_root / "result" / task / model_name
-    cand1 = task_root / device_tag / f"{model_name}_metrics.json"
-    cand2 = task_root / f"{model_name}_metrics.json"
+    return safe_load_json(cand1) or safe_load_json(cand2)
 
-    data = safe_load_json(cand1)
-    if data is not None:
-        return data
-
-    data = safe_load_json(cand2)
-    if data is not None:
-        return data
-
-    return None
-
-
-# ============================================================
-# Colectar info ONNX Runtime / TensorRT
-# ============================================================
 
 def find_onnxruntime_bench(onnx_path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Dado un ONNX, busca el JSON de ONNX Runtime en el mismo directorio:
-
-        <onnx_stem>_onnxruntime_benchmark.json
-    """
-    json_path = onnx_path.with_suffix("")  # quita .onnx
+    json_path = onnx_path.with_suffix("")
     json_path = json_path.with_name(json_path.name + "_onnxruntime_benchmark.json")
     return safe_load_json(json_path)
 
 
 def find_tensorrt_bench(onnx_path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Dado un ONNX, busca el JSON de TensorRT en el mismo directorio:
-
-        <onnx_stem>_tensorrt_bench.json
-    """
-    json_path = onnx_path.with_suffix("")  # quita .onnx
+    json_path = onnx_path.with_suffix("")
     json_path = json_path.with_name(json_path.name + "_tensorrt_bench.json")
     return safe_load_json(json_path)
 
 
 # ============================================================
-# Construir filas para CSV global
+# NORMALIZATION HELPERS
 # ============================================================
 
-def row_from_pytorch(
-    data: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Convierte un JSON de métricas PyTorch en una fila estándar de comparación.
-    """
-    model_name = data.get("model_name", "unknown_model")
-    task = data.get("task", "unknown_task")
-    dataset = data.get("dataset", "unknown_dataset")
-    num_classes = data.get("num_classes", None)
-    device_name = data.get("device_name", "unknown_device")
-    device_tag = data.get("device_tag", "UNKNOWN")
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
-    benchmark = data.get("benchmark", {}) or {}
-    mean_latency_ms = benchmark.get("mean_latency_ms")
-    fps = benchmark.get("fps")
-    throughput = benchmark.get("throughput")
-    vram_used_mb = benchmark.get("vram_used_mb")
+
+def normalize_backend_metrics(data: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Devuelve siempre:
+      - latency_ms_per_batch
+      - qps_batches
+      - throughput_samples_s
+
+    Priorizando el esquema nuevo, con fallback a esquema antiguo.
+    """
+    # Nuevo esquema (preferido)
+    lat = _to_float(data.get("latency_ms_per_batch"))
+    qps = _to_float(data.get("qps_batches"))
+    thr = _to_float(data.get("throughput_samples_s"))
+
+    if lat is not None or qps is not None or thr is not None:
+        return {
+            "latency_ms_per_batch": lat,
+            "qps_batches": qps,
+            "throughput_samples_s": thr,
+        }
+
+    # Esquema antiguo (fallback)
+    # ORT antiguo: mean_latency_ms, fps, throughput
+    lat_old = _to_float(data.get("mean_latency_ms"))
+    fps_old = _to_float(data.get("fps"))
+    thr_old = _to_float(data.get("throughput"))
+
+    # Interpretación:
+    # - lat_old suele ser ms/batch
+    # - fps_old y thr_old en tu script antiguo eran "samples/s" (aprox)
+    #   (no batches/s).
+    # No podemos reconstruir qps_batches sin batch_size; lo dejamos None.
+    throughput_samples = fps_old if fps_old is not None else thr_old
+
+    return {
+        "latency_ms_per_batch": lat_old,
+        "qps_batches": None,
+        "throughput_samples_s": throughput_samples,
+    }
+
+
+def extract_env_fields(env: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    env = env or {}
+    return {
+        "host": env.get("host"),
+        "timestamp_utc": env.get("timestamp_utc"),
+        "backend_selected": env.get("backend_selected"),
+        "gpu_name": env.get("gpu_name"),
+        "device_id": env.get("device_id"),
+        "cuda_visible_devices": env.get("cuda_visible_devices"),
+        "onnxruntime_version": env.get("onnxruntime_version"),
+        "tensorrt_version": env.get("tensorrt_version"),
+        "providers": env.get("providers"),
+    }
+
+
+# ============================================================
+# ROW BUILDERS
+# ============================================================
+
+def row_from_pytorch(pytorch_json: Dict[str, Any]) -> Dict[str, Any]:
+    model_name = pytorch_json.get("model_name", "unknown_model")
+    task = pytorch_json.get("task", "unknown_task")
+    dataset = pytorch_json.get("dataset", None)
+    num_classes = pytorch_json.get("num_classes", None)
+    device_name = pytorch_json.get("device_name", None)
+    device_tag = pytorch_json.get("device_tag", "UNKNOWN")
+
+    bench = pytorch_json.get("benchmark", {}) or {}
+
+    # Tu baseline PyTorch típicamente usa:
+    # mean_latency_ms, fps, throughput
+    # Lo normalizamos:
+    lat = _to_float(bench.get("latency_ms_per_batch")) or _to_float(bench.get("mean_latency_ms"))
+    qps = _to_float(bench.get("qps_batches"))  # usualmente no existe en PyTorch
+    thr = _to_float(bench.get("throughput_samples_s")) or _to_float(bench.get("throughput")) or _to_float(bench.get("fps"))
+
+    batch_size = bench.get("batch_size", None)
+    precision = bench.get("precision", "fp32")
 
     return {
         "task": task,
@@ -232,35 +194,40 @@ def row_from_pytorch(
         "backend": "pytorch",
         "dataset": dataset,
         "num_classes": num_classes,
-        "device_name": device_name,
         "device_tag": device_tag,
-        "batch_size": benchmark.get("batch_size", None),
-        "precision": "fp32",  # asumimos fp32
-        "mean_latency_ms": mean_latency_ms,
-        "fps": fps,
-        "throughput": throughput,
-        "vram_used_mb": vram_used_mb,
+        "device_name": device_name,
+        "batch_size": batch_size,
+        "precision": precision,
+        "latency_ms_per_batch": lat,
+        "qps_batches": qps,
+        "throughput_samples_s": thr,
+        "vram_used_mb": bench.get("vram_used_mb"),
+        "host": None,
+        "timestamp_utc": None,
+        "gpu_name": None,
+        "device_id": None,
+        "cuda_visible_devices": None,
+        "onnxruntime_version": None,
+        "tensorrt_version": None,
+        "providers": None,
         "extra_info": "",
-        "source_json": data.get("artifacts", {}).get("best_model_path", ""),
+        "source_json": str(pytorch_json.get("artifacts", {}).get("best_model_path", "")),
     }
 
 
-def row_from_onnxruntime(
-    onnx_path: Path,
-    model_name: str,
-    device_tag: str,
-    task_fallback: str,
-    ort_data: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Convierte JSON de ONNX Runtime en una fila estándar.
-    """
-    task = ort_data.get("task", task_fallback)
-    batch_size = ort_data.get("batch_size", None)
-    mean_latency_ms = ort_data.get("mean_latency_ms", None)
-    fps = ort_data.get("fps", None)
-    throughput = ort_data.get("throughput", None)
-    providers = ort_data.get("providers", [])
+def row_from_onnxruntime(onnx_path: Path, model_name: str, device_tag: str, task_fallback: str, ort_json: Dict[str, Any]) -> Dict[str, Any]:
+    task = ort_json.get("task", task_fallback)
+    batch_size = ort_json.get("batch_size", None)
+    precision = ort_json.get("precision", "fp32")
+
+    m = normalize_backend_metrics(ort_json)
+    env_fields = extract_env_fields(ort_json.get("env"))
+
+    extra = ""
+    # providers puede estar en env o en campo antiguo "providers"
+    providers = env_fields.get("providers") or ort_json.get("providers")
+    if providers:
+        extra = f"providers={providers}"
 
     return {
         "task": task,
@@ -268,39 +235,39 @@ def row_from_onnxruntime(
         "backend": "onnxruntime",
         "dataset": None,
         "num_classes": None,
-        "device_name": None,
         "device_tag": device_tag,
+        "device_name": None,
         "batch_size": batch_size,
-        "precision": "fp32",  # por defecto asumimos fp32
-        "mean_latency_ms": mean_latency_ms,
-        "fps": fps,
-        "throughput": throughput,
+        "precision": precision,
+        "latency_ms_per_batch": m["latency_ms_per_batch"],
+        "qps_batches": m["qps_batches"],
+        "throughput_samples_s": m["throughput_samples_s"],
         "vram_used_mb": None,
-        "extra_info": f"providers={providers}",
-        "source_json": str(onnx_path.with_suffix("").with_name(
-            onnx_path.with_suffix("").name + "_onnxruntime_benchmark.json"
-        )),
+        "host": env_fields.get("host"),
+        "timestamp_utc": env_fields.get("timestamp_utc"),
+        "gpu_name": env_fields.get("gpu_name"),
+        "device_id": env_fields.get("device_id"),
+        "cuda_visible_devices": env_fields.get("cuda_visible_devices"),
+        "onnxruntime_version": env_fields.get("onnxruntime_version"),
+        "tensorrt_version": None,
+        "providers": providers,
+        "extra_info": extra,
+        "source_json": str(onnx_path.with_suffix("").with_name(onnx_path.with_suffix("").name + "_onnxruntime_benchmark.json")),
     }
 
 
-def row_from_tensorrt(
-    onnx_path: Path,
-    model_name: str,
-    device_tag: str,
-    task_fallback: str,
-    trt_data: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Convierte JSON de TensorRT en una fila estándar.
-    """
-    task = trt_data.get("task", task_fallback)
-    batch_size = trt_data.get("batch_size", None)
-    precision = trt_data.get("precision", "fp16/32?")
-    bench = trt_data.get("benchmark_tensorrt", {}) or {}
+def row_from_tensorrt(onnx_path: Path, model_name: str, device_tag: str, task_fallback: str, trt_json: Dict[str, Any]) -> Dict[str, Any]:
+    task = trt_json.get("task", task_fallback)
+    batch_size = trt_json.get("batch_size", None)
+    precision = trt_json.get("precision", trt_json.get("benchmark_tensorrt", {}).get("precision", "fp16/fp32?"))
 
-    mean_latency_ms = bench.get("mean_latency_ms", None)
-    fps = bench.get("fps", None)
-    throughput = bench.get("throughput", None)
+    m = normalize_backend_metrics(trt_json)
+    env_fields = extract_env_fields(trt_json.get("env"))
+
+    extra = ""
+    cmd = trt_json.get("trtexec_cmd")
+    if cmd:
+        extra = "trtexec_cmd=present"
 
     return {
         "task": task,
@@ -308,76 +275,80 @@ def row_from_tensorrt(
         "backend": "tensorrt",
         "dataset": None,
         "num_classes": None,
-        "device_name": None,
         "device_tag": device_tag,
+        "device_name": None,
         "batch_size": batch_size,
         "precision": precision,
-        "mean_latency_ms": mean_latency_ms,
-        "fps": fps,
-        "throughput": throughput,
+        "latency_ms_per_batch": m["latency_ms_per_batch"],
+        "qps_batches": m["qps_batches"],
+        "throughput_samples_s": m["throughput_samples_s"],
         "vram_used_mb": None,
-        "extra_info": "",
-        "source_json": str(onnx_path.with_suffix("").with_name(
-            onnx_path.with_suffix("").name + "_tensorrt_bench.json"
-        )),
+        "host": env_fields.get("host"),
+        "timestamp_utc": env_fields.get("timestamp_utc"),
+        "gpu_name": env_fields.get("gpu_name"),
+        "device_id": env_fields.get("device_id"),
+        "cuda_visible_devices": env_fields.get("cuda_visible_devices"),
+        "onnxruntime_version": None,
+        "tensorrt_version": env_fields.get("tensorrt_version"),
+        "providers": None,
+        "extra_info": extra,
+        "source_json": str(onnx_path.with_suffix("").with_name(onnx_path.with_suffix("").name + "_tensorrt_bench.json")),
     }
 
 
 # ============================================================
-# Gráficos comparativos por backend
+# PLOTTING
 # ============================================================
 
 def plot_backend_comparison(
     rows: List[Dict[str, Any]],
     out_path_latency: Path,
-    out_path_fps: Path,
+    out_path_throughput: Path,
     title_prefix: str,
 ) -> None:
     """
-    Dibuja dos gráficos de barras:
-        - Latencia media (ms) por backend
-        - FPS por backend
-    para un conjunto de filas (todas mismas task/model/device_tag).
+    Barras:
+      - Latencia ms/batch
+      - Throughput samples/s
     """
-    backends = []
-    latencies = []
-    fps_values = []
+    backends = [r["backend"] for r in rows]
 
-    for r in rows:
-        b = r["backend"]
-        mean_lat = r["mean_latency_ms"]
-        fps = r["fps"]
-
-        backends.append(b)
-        latencies.append(mean_lat if mean_lat is not None else np.nan)
-        fps_values.append(fps if fps is not None else np.nan)
+    lat = [
+        float(r["latency_ms_per_batch"]) if r.get("latency_ms_per_batch") is not None else np.nan
+        for r in rows
+    ]
+    thr = [
+        float(r["throughput_samples_s"]) if r.get("throughput_samples_s") is not None else np.nan
+        for r in rows
+    ]
 
     # Latencia
-    plt.figure(figsize=(6, 4))
+    plt.figure(figsize=(7, 4))
     x = np.arange(len(backends))
-    plt.bar(x, latencies)
+    plt.bar(x, lat)
     plt.xticks(x, backends)
-    plt.ylabel("Latencia media (ms)")
+    plt.ylabel("Latencia (ms/batch)")
     plt.title(f"{title_prefix} — Latencia por backend")
-    plt.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.grid(axis="y", linestyle="--", alpha=0.35)
     plt.tight_layout()
     out_path_latency.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path_latency, bbox_inches="tight")
     plt.close()
-    print(f"[INFO] Guardado gráfico de latencia: {out_path_latency}")
+    print(f"[INFO] Guardado: {out_path_latency}")
 
-    # FPS
-    plt.figure(figsize=(6, 4))
+    # Throughput
+    plt.figure(figsize=(7, 4))
     x = np.arange(len(backends))
-    plt.bar(x, fps_values)
+    plt.bar(x, thr)
     plt.xticks(x, backends)
-    plt.ylabel("FPS (aprox. samples/s)")
-    plt.title(f"{title_prefix} — FPS por backend")
-    plt.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.ylabel("Throughput (samples/s)")
+    plt.title(f"{title_prefix} — Throughput por backend")
+    plt.grid(axis="y", linestyle="--", alpha=0.35)
     plt.tight_layout()
-    plt.savefig(out_path_fps, bbox_inches="tight")
+    out_path_throughput.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path_throughput, bbox_inches="tight")
     plt.close()
-    print(f"[INFO] Guardado gráfico de FPS: {out_path_fps}")
+    print(f"[INFO] Guardado: {out_path_throughput}")
 
 
 # ============================================================
@@ -390,86 +361,59 @@ def main() -> None:
     global_dir = onnx_root / "global"
     global_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Buscar todos los modelos ONNX
     onnx_files = list(onnx_root.rglob("*.onnx"))
     if not onnx_files:
         print(f"[WARN] No se encontraron archivos .onnx en {onnx_root}")
         return
 
-    print(f"[INFO] Se encontraron {len(onnx_files)} modelos ONNX.")
+    print(f"[INFO] Se encontraron {len(onnx_files)} ONNX.")
 
     all_rows: List[Dict[str, Any]] = []
 
     for onnx_path in onnx_files:
         rel = onnx_path.relative_to(project_root)
-        print(f"\n[INFO] Procesando ONNX: {rel}")
+        print(f"\n[INFO] ONNX: {rel}")
 
-        # Inferir task desde carpeta padre (classification/detection)
+        # task inferido por carpeta: models/onnx/<task>/...
         try:
             parent_task = onnx_path.parent.relative_to(onnx_root).parts[0]
         except Exception:
             parent_task = "unknown"
 
         model_name, device_tag = parse_onnx_name(onnx_path)
-        print(f"       model_name={model_name} | device_tag={device_tag} | task={parent_task}")
+        print(f"       task={parent_task} | model={model_name} | device_tag={device_tag}")
 
-        # --------------------------------------------------------
-        # PyTorch (baseline) - si existe
-        # --------------------------------------------------------
+        # ---- PyTorch baseline
         if parent_task in ("classification", "detection"):
-            pyt_metrics = find_pytorch_metrics(
-                project_root=project_root,
-                task=parent_task,
-                model_name=model_name,
-                device_tag=device_tag,
-            )
-            if pyt_metrics is not None:
-                row_pt = row_from_pytorch(pyt_metrics)
-                all_rows.append(row_pt)
-                print("       [OK] PyTorch metrics encontradas.")
+            pt = find_pytorch_metrics(project_root, parent_task, model_name, device_tag)
+            if pt is not None:
+                all_rows.append(row_from_pytorch(pt))
+                print("       [OK] PyTorch metrics.")
             else:
-                print("       [WARN] No se encontraron métricas PyTorch para este modelo.")
+                print("       [WARN] PyTorch metrics no encontradas.")
 
-        # --------------------------------------------------------
-        # ONNX Runtime
-        # --------------------------------------------------------
-        ort_data = find_onnxruntime_bench(onnx_path)
-        if ort_data is not None:
-            row_ort = row_from_onnxruntime(
-                onnx_path=onnx_path,
-                model_name=model_name,
-                device_tag=device_tag,
-                task_fallback=parent_task,
-                ort_data=ort_data,
-            )
-            all_rows.append(row_ort)
-            print("       [OK] ONNX Runtime benchmark encontrado.")
+        # ---- ORT
+        ort_json = find_onnxruntime_bench(onnx_path)
+        if ort_json is not None:
+            all_rows.append(row_from_onnxruntime(onnx_path, model_name, device_tag, parent_task, ort_json))
+            print("       [OK] ORT benchmark.")
         else:
-            print("       [WARN] No se encontró benchmark de ONNX Runtime para este modelo.")
+            print("       [WARN] ORT benchmark no encontrado.")
 
-        # --------------------------------------------------------
-        # TensorRT
-        # --------------------------------------------------------
-        trt_data = find_tensorrt_bench(onnx_path)
-        if trt_data is not None:
-            row_trt = row_from_tensorrt(
-                onnx_path=onnx_path,
-                model_name=model_name,
-                device_tag=device_tag,
-                task_fallback=parent_task,
-                trt_data=trt_data,
-            )
-            all_rows.append(row_trt)
-            print("       [OK] TensorRT benchmark encontrado.")
+        # ---- TRT
+        trt_json = find_tensorrt_bench(onnx_path)
+        if trt_json is not None:
+            all_rows.append(row_from_tensorrt(onnx_path, model_name, device_tag, parent_task, trt_json))
+            print("       [OK] TensorRT benchmark.")
         else:
-            print("       [WARN] No se encontró benchmark de TensorRT para este modelo.")
+            print("       [WARN] TensorRT benchmark no encontrado.")
 
     if not all_rows:
-        print("[WARN] No se generaron filas de resultados (¿faltan JSONs?).")
+        print("[WARN] No hay filas para exportar (faltan JSONs).")
         return
 
     # --------------------------------------------------------
-    # Guardar CSV global
+    # CSV global
     # --------------------------------------------------------
     csv_path = global_dir / "onnx_backends_summary.csv"
     fieldnames = [
@@ -478,54 +422,66 @@ def main() -> None:
         "backend",
         "dataset",
         "num_classes",
-        "device_name",
         "device_tag",
+        "device_name",
         "batch_size",
         "precision",
-        "mean_latency_ms",
-        "fps",
-        "throughput",
+        "latency_ms_per_batch",
+        "qps_batches",
+        "throughput_samples_s",
         "vram_used_mb",
+        "host",
+        "timestamp_utc",
+        "gpu_name",
+        "device_id",
+        "cuda_visible_devices",
+        "onnxruntime_version",
+        "tensorrt_version",
+        "providers",
         "extra_info",
         "source_json",
     ]
 
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
         for r in all_rows:
-            writer.writerow(r)
+            # asegurar todas las keys
+            out = {k: r.get(k) for k in fieldnames}
+            w.writerow(out)
 
-    print(f"\n[INFO] CSV global guardado en: {csv_path}")
+    print(f"\n[INFO] CSV guardado en: {csv_path}")
 
     # --------------------------------------------------------
-    # Gráficos comparativos por (task, model_name, device_tag)
+    # Gráficos por (task, model, device_tag)
     # --------------------------------------------------------
-    print("[INFO] Generando gráficos comparativos por backend...")
-
-    # Agrupar filas por clave (task, model_name, device_tag)
     grouped: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
     for r in all_rows:
-        key = (r["task"], r["model_name"], r["device_tag"])
+        key = (str(r.get("task")), str(r.get("model_name")), str(r.get("device_tag")))
         grouped.setdefault(key, []).append(r)
 
+    print("[INFO] Generando gráficos...")
+
     for (task, model_name, device_tag), rows in grouped.items():
-        # Necesitamos al menos 2 backends para comparar
-        backends_present = sorted(set(r["backend"] for r in rows))
+        backends_present = sorted(set(r["backend"] for r in rows if r.get("backend")))
         if len(backends_present) < 2:
-            continue
+            continue  # nada que comparar
+
+        # Orden preferido: pytorch, onnxruntime, tensorrt
+        order = {"pytorch": 0, "onnxruntime": 1, "tensorrt": 2}
+        rows_sorted = sorted(rows, key=lambda x: order.get(x["backend"], 99))
 
         title_prefix = f"{task} — {model_name} — {device_tag}"
         safe_model = model_name.replace("/", "_")
         safe_dev = device_tag.replace("/", "_")
 
         out_lat = global_dir / f"{task}_{safe_model}_{safe_dev}_latency_by_backend.png"
-        out_fps = global_dir / f"{task}_{safe_model}_{safe_dev}_fps_by_backend.png"
+        out_thr = global_dir / f"{task}_{safe_model}_{safe_dev}_throughput_by_backend.png"
 
         plot_backend_comparison(
-            rows=rows,
+            rows=rows_sorted,
             out_path_latency=out_lat,
-            out_path_fps=out_fps,
+            out_path_throughput=out_thr,
             title_prefix=title_prefix,
         )
 

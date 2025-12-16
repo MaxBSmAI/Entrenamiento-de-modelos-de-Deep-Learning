@@ -1,301 +1,349 @@
-# src/onnx/export_to_onnx.py
-
 from __future__ import annotations
 
 import argparse
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import sys
 import torch
 import torch.nn as nn
-from torchvision import models
-
 
 # ============================================================
-# Añadir src al sys.path
-# ============================================================
-SRC_ROOT = Path(__file__).resolve().parents[1]  # .../src
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-
-# ============================================================
-# Device helpers
+# Utils
 # ============================================================
 
-def get_device_and_tags() -> Tuple[torch.device, str, str]:
-    """
-    Devuelve:
-        device      : torch.device ('cuda' o 'cpu')
-        device_name : nombre legible (RTX 4080, A100, CPU, etc.)
-        device_tag  : versión "amigable" para carpetas (RTX_4080, A100, CPU)
-    """
+def _safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def _strip_state_dict_prefix(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in state.items():
+        for pref in ("module.", "model."):
+            if k.startswith(pref):
+                k = k[len(pref):]
+        out[k] = v
+    return out
+
+def _load_json(p: Path) -> Dict[str, Any]:
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def _infer_num_classes_from_metrics(metrics_path: Path) -> Optional[int]:
+    if not metrics_path.exists():
+        return None
+    try:
+        d = _load_json(metrics_path)
+    except Exception:
+        return None
+    if isinstance(d.get("num_classes"), int):
+        return int(d["num_classes"])
+    for k in ("classes", "class_names", "labels"):
+        if isinstance(d.get(k), list):
+            return len(d[k])
+    return None
+
+def _resolve_device(device_id: int) -> torch.device:
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        raw_name = torch.cuda.get_device_name(0)
-        raw_lower = raw_name.lower()
+        return torch.device(f"cuda:{device_id}")
+    return torch.device("cpu")
 
-        if "4080" in raw_lower:
-            device_name = "RTX 4080"
-            device_tag = "RTX_4080"
-        elif "4060" in raw_lower:
-            device_name = "RTX 4060"
-            device_tag = "RTX_4060"
-        elif "a100" in raw_lower:
-            device_name = "A100"
-            device_tag = "A100"
-        else:
-            device_name = raw_name.strip()
-            device_tag = raw_name.replace(" ", "_").replace("-", "_")
-    else:
-        device = torch.device("cpu")
-        device_name = "CPU"
-        device_tag = "CPU"
-
-    return device, device_name, device_tag
-
+def _device_tag_from_torch(device: torch.device) -> str:
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(device).replace(" ", "_")
+    return "CPU"
 
 # ============================================================
-# Construcción de modelos de CLASIFICACIÓN
+# Classification loaders
 # ============================================================
 
-def build_classification_model(model_name: str, num_classes: int) -> nn.Module:
-    """
-    Reconstruye el modelo de clasificación según 'model_name'.
-
-    Por ahora soporta:
-        - 'resnet50_miniimagenet'
-        - 'vit_b16_miniimagenet'
-    """
-    model_name = model_name.lower()
-
-    if model_name == "resnet50_miniimagenet":
-        # ResNet-50 estándar, reemplazando la FC final
-        model = models.resnet50(weights=None)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
-        return model
-
-    elif model_name == "vit_b16_miniimagenet":
-        # ViT-B/16 desde timm
+def _load_classification_model(model_key: str, num_classes: int) -> nn.Module:
+    model_key = model_key.lower()
+    if model_key == "resnet50_miniimagenet":
+        import torchvision
+        m = torchvision.models.resnet50(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        return m
+    if model_key == "vit_b16_miniimagenet":
         import timm
-
-        # Debe coincidir con el usado en train_vit_b16_imagenet.py
-        model = timm.create_model(
-            "vit_base_patch16_224.augreg_in21k_ft_in1k",
+        return timm.create_model(
+            "vit_base_patch16_224",
             pretrained=False,
             num_classes=num_classes,
         )
-        return model
+    raise ValueError(f"Modelo de clasificación no soportado: {model_key}")
 
-    else:
-        raise ValueError(f"Modelo de clasificación no soportado: {model_name}")
+def _resolve_classification_checkpoint(model_key: str, device_tag: str) -> Path:
+    return (
+        Path("/workspace/result/classification")
+        / model_key
+        / device_tag
+        / f"{model_key}_best.pth"
+    )
 
+def _resolve_classification_metrics(model_key: str, device_tag: str) -> Path:
+    base = Path("/workspace/result/classification") / model_key / device_tag
+    for f in ("metrics.json", f"{model_key}_metrics.json"):
+        if (base / f).exists():
+            return base / f
+    return base / "metrics.json"
 
 # ============================================================
-# Utilidades de paths
+# Detection loaders (torchvision)
 # ============================================================
 
-def find_checkpoint(
-    project_root: Path,
-    task: str,
-    model_name: str,
+def _load_torchvision_detector(model_key: str) -> nn.Module:
+    import torchvision
+    model_key = model_key.lower()
+
+    if model_key == "fasterrcnn_resnet50_fpn_coco":
+        w = torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+        return torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=w)
+
+    if model_key == "retinanet_resnet50_fpn_coco":
+        w = torchvision.models.detection.RetinaNet_ResNet50_FPN_Weights.DEFAULT
+        return torchvision.models.detection.retinanet_resnet50_fpn(weights=w)
+
+    raise ValueError(f"Detector no soportado: {model_key}")
+
+# ============================================================
+# Detection ONNX Wrapper (TensorRT-safe)
+# ============================================================
+
+class DetectionONNXWrapper(nn.Module):
+    """
+    Wrapper diseñado explícitamente para TensorRT:
+      - input: (B,3,H,W)
+      - output:
+          boxes  (B, max_det, 4)
+          scores (B, max_det)
+          labels (B, max_det)
+    SIN topk, SIN if dinámicos, SIN tensores vacíos.
+    """
+
+    def __init__(self, det_model: nn.Module, max_det: int):
+        super().__init__()
+        self.det_model = det_model
+        self.max_det = int(max_det)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        imgs = torch.unbind(x, dim=0)  # traceable
+        outputs = self.det_model(list(imgs))
+
+        B = x.shape[0]
+        device = x.device
+
+        boxes_out = torch.zeros((B, self.max_det, 4), device=device)
+        scores_out = torch.zeros((B, self.max_det), device=device)
+        labels_out = torch.zeros((B, self.max_det), dtype=torch.int64, device=device)
+
+        for i in range(B):
+            boxes = outputs[i]["boxes"]
+            scores = outputs[i]["scores"]
+            labels = outputs[i]["labels"]
+
+            z_boxes = torch.zeros((self.max_det, 4), device=device)
+            z_scores = torch.zeros((self.max_det,), device=device)
+            z_labels = torch.zeros((self.max_det,), dtype=torch.int64, device=device)
+
+            boxes = torch.cat([boxes, z_boxes], dim=0)[: self.max_det]
+            scores = torch.cat([scores, z_scores], dim=0)[: self.max_det]
+            labels = torch.cat([labels, z_labels], dim=0)[: self.max_det]
+
+            boxes_out[i] = boxes
+            scores_out[i] = scores
+            labels_out[i] = labels
+
+        return boxes_out, scores_out, labels_out
+
+# ============================================================
+# Metadata
+# ============================================================
+
+@dataclass
+class ExportMetadata:
+    task: str
+    model: str
+    device_id: int
+    device_tag: str
+    checkpoint: Optional[str]
+    img_size: int
+    batch_size: int
+    opset: int
+    max_det: Optional[int]
+    onnx_path: str
+
+# ============================================================
+# Exporters
+# ============================================================
+
+def export_classification(
+    model_key: str,
+    device: torch.device,
     device_tag: str,
+    img_size: int,
+    batch_size: int,
+    opset: int,
+    output_dir: Path,
+    checkpoint: Optional[Path],
+    save_export_json: bool,
 ) -> Path:
-    """
-    Busca el .pth del mejor modelo en:
-        result/<task>/<model_name>/<device_tag>/<model_name>_best.pth
-    y si no existe, prueba:
-        result/<task>/<model_name>/<model_name>_best.pth
-    """
-    task_root = project_root / "result" / task / model_name
 
-    cand1 = task_root / device_tag / f"{model_name}_best.pth"
-    cand2 = task_root / f"{model_name}_best.pth"
+    output_dir = output_dir / "classification"
+    _safe_mkdir(output_dir)
 
-    if cand1.exists():
-        return cand1
-    if cand2.exists():
-        return cand2
+    metrics = _resolve_classification_metrics(model_key, device_tag)
+    num_classes = _infer_num_classes_from_metrics(metrics) or 100
 
-    raise FileNotFoundError(
-        f"No se encontró checkpoint para {model_name}. "
-        f"Probados: {cand1} y {cand2}"
-    )
+    if checkpoint is None:
+        checkpoint = _resolve_classification_checkpoint(model_key, device_tag)
 
+    model = _load_classification_model(model_key, num_classes)
+    model.to(device).eval()
 
-def find_metrics_json(ckpt_path: Path) -> Path | None:
-    """
-    Intenta encontrar el JSON de métricas en la misma carpeta que el .pth.
-    """
-    json_path = ckpt_path.with_name(ckpt_path.stem.replace("_best", "_metrics") + ".json")
-    return json_path if json_path.exists() else None
+    ckpt = torch.load(checkpoint, map_location="cpu")
+    state = ckpt.get("state_dict", ckpt)
+    state = _strip_state_dict_prefix(state)
+    model.load_state_dict(state, strict=False)
 
+    onnx_path = output_dir / f"{model_key}__{device_tag}.onnx"
+    dummy = torch.randn(batch_size, 3, img_size, img_size, device=device)
 
-# ============================================================
-# Parser
-# ============================================================
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Exportar modelos entrenados a ONNX para interoperabilidad HPC",
-    )
-
-    parser.add_argument(
-        "--task",
-        type=str,
-        default="classification",
-        choices=["classification"],   # por ahora solo clasificación
-        help="Tarea a exportar (classification; detection se puede agregar luego).",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Nombre lógico del modelo (ej: resnet50_miniimagenet, vit_b16_miniimagenet).",
-    )
-    parser.add_argument(
-        "--device_tag",
-        type=str,
-        default=None,
-        help="Tag del dispositivo usado en el entrenamiento (RTX_4060, RTX_4080, A100...). "
-             "Si no se especifica, se infiere del GPU actual.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Ruta explícita al .pth. Si se omite, se busca en result/<task>/<model>/<device_tag>/.",
-    )
-    parser.add_argument(
-        "--img_size",
-        type=int,
-        default=224,
-        help="Tamaño de imagen cuadrada para el dummy input (clasificación).",
-    )
-    parser.add_argument(
-        "--opset",
-        type=int,
-        default=17,
-        help="Versión de opset ONNX.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Directorio base de salida para .onnx (por defecto models/onnx/<task>/).",
-    )
-
-    return parser.parse_args()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-    args = parse_args()
-
-    project_root = Path(__file__).resolve().parents[2]
-    device, device_name, auto_device_tag = get_device_and_tags()
-
-    device_tag = args.device_tag or auto_device_tag
-    print(f"[INFO] Device actual: {device} ({device_name}) → device_tag={device_tag}")
-
-    # ------------------------------------------------------------------
-    # Localizar checkpoint
-    # ------------------------------------------------------------------
-    if args.checkpoint is not None:
-        ckpt_path = Path(args.checkpoint)
-    else:
-        ckpt_path = find_checkpoint(
-            project_root=project_root,
-            task=args.task,
-            model_name=args.model,
-            device_tag=device_tag,
-        )
-
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint no encontrado: {ckpt_path}")
-
-    print(f"[INFO] Usando checkpoint: {ckpt_path}")
-
-    # ------------------------------------------------------------------
-    # Leer num_classes desde el JSON si está disponible
-    # ------------------------------------------------------------------
-    num_classes = 100  # valor por defecto para mini-ImageNet
-    metrics_json = find_metrics_json(ckpt_path)
-    if metrics_json is not None:
-        try:
-            import json
-            with open(metrics_json, "r") as f:
-                data = json.load(f)
-            num_classes = int(data.get("num_classes", num_classes))
-            print(f"[INFO] num_classes obtenido desde {metrics_json}: {num_classes}")
-        except Exception as e:
-            print(f"[WARN] No se pudo leer num_classes desde {metrics_json}: {e}")
-    else:
-        print(f"[INFO] No se encontró JSON de métricas; usando num_classes={num_classes}")
-
-    # ------------------------------------------------------------------
-    # Construir modelo según la tarea
-    # ------------------------------------------------------------------
-    if args.task == "classification":
-        model = build_classification_model(args.model, num_classes=num_classes)
-    else:
-        raise NotImplementedError("Por ahora solo se soporta 'classification' en export_to_onnx.py")
-
-    # Cargar pesos
-    state_dict = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-
-    # ------------------------------------------------------------------
-    # Crear dummy input
-    # ------------------------------------------------------------------
-    img_size = args.img_size
-    dummy_input = torch.randn(1, 3, img_size, img_size, device=device)
-    print(f"[INFO] Dummy input shape: {tuple(dummy_input.shape)}")
-
-    # ------------------------------------------------------------------
-    # Directorio de salida
-    # ------------------------------------------------------------------
-    if args.output_dir is not None:
-        out_base = Path(args.output_dir)
-    else:
-        out_base = project_root / "models" / "onnx" / args.task
-
-    out_base.mkdir(parents=True, exist_ok=True)
-
-    onnx_name = f"{args.model}__{device_tag}.onnx"
-    onnx_path = out_base / onnx_name
-
-    # ------------------------------------------------------------------
-    # Exportar a ONNX
-    # ------------------------------------------------------------------
-    print(f"[INFO] Exportando a ONNX → {onnx_path}")
     torch.onnx.export(
         model,
-        dummy_input,
-        onnx_path,
-        export_params=True,
-        opset_version=args.opset,
-        do_constant_folding=True,
+        dummy,
+        onnx_path.as_posix(),
+        opset_version=opset,
         input_names=["input"],
         output_names=["logits"],
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "logits": {0: "batch_size"},
-        },
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
     )
 
-    print("\n[OK] Exportación completada.")
-    print(f"[OK] Modelo ONNX guardado en: {onnx_path}")
-    print(f"[INFO] Ahora puedes usar benchmark_onnx_runtime.py y benchmark_tensorrt.py "
-          f"para medir latencia/FPS en RTX 4080 y A100.")
+    if save_export_json:
+        meta = ExportMetadata(
+            task="classification",
+            model=model_key,
+            device_id=device.index if device.type == "cuda" else -1,
+            device_tag=device_tag,
+            checkpoint=str(checkpoint),
+            img_size=img_size,
+            batch_size=batch_size,
+            opset=opset,
+            max_det=None,
+            onnx_path=str(onnx_path),
+        )
+        onnx_path.with_suffix(".export.json").write_text(
+            json.dumps(asdict(meta), indent=2)
+        )
 
+    return onnx_path
+
+def export_detection(
+    model_key: str,
+    device: torch.device,
+    device_tag: str,
+    img_size: int,
+    batch_size: int,
+    opset: int,
+    output_dir: Path,
+    max_det: int,
+    save_export_json: bool,
+) -> Path:
+
+    output_dir = output_dir / "detection"
+    _safe_mkdir(output_dir)
+
+    det = _load_torchvision_detector(model_key)
+    det.to(device).eval()
+
+    wrapper = DetectionONNXWrapper(det, max_det).to(device).eval()
+
+    onnx_path = output_dir / f"{model_key}__{device_tag}.onnx"
+    dummy = torch.randn(batch_size, 3, img_size, img_size, device=device)
+
+    torch.onnx.export(
+        wrapper,
+        dummy,
+        onnx_path.as_posix(),
+        opset_version=opset,
+        input_names=["input"],
+        output_names=["boxes", "scores", "labels"],
+        dynamic_axes=None,  # CRÍTICO PARA TENSORRT
+    )
+
+    if save_export_json:
+        meta = ExportMetadata(
+            task="detection",
+            model=model_key,
+            device_id=device.index if device.type == "cuda" else -1,
+            device_tag=device_tag,
+            checkpoint=None,
+            img_size=img_size,
+            batch_size=batch_size,
+            opset=opset,
+            max_det=max_det,
+            onnx_path=str(onnx_path),
+        )
+        onnx_path.with_suffix(".export.json").write_text(
+            json.dumps(asdict(meta), indent=2)
+        )
+
+    return onnx_path
+
+# ============================================================
+# CLI
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--task", choices=["classification", "detection"], required=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--device-id", type=int, default=0)
+    p.add_argument("--device-tag", default=None)
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--img-size", type=int, default=224)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--max-det", type=int, default=100)
+    p.add_argument("--opset", type=int, default=17)
+    p.add_argument("--output-dir", default="/workspace/models/onnx")
+    p.add_argument("--save-export-json", action="store_true")
+    return p
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    device = _resolve_device(args.device_id)
+    device_tag = args.device_tag or _device_tag_from_torch(device)
+
+    out = Path(args.output_dir)
+    _safe_mkdir(out)
+
+    if args.task == "classification":
+        export_classification(
+            args.model,
+            device,
+            device_tag,
+            args.img_size,
+            args.batch_size,
+            args.opset,
+            out,
+            Path(args.checkpoint) if args.checkpoint else None,
+            args.save_export_json,
+        )
+    else:
+        export_detection(
+            args.model,
+            device,
+            device_tag,
+            args.img_size,
+            args.batch_size,
+            args.opset,
+            out,
+            args.max_det,
+            args.save_export_json,
+        )
+
+    print("[DONE] export_to_onnx.py finalizado correctamente.")
 
 if __name__ == "__main__":
     main()
